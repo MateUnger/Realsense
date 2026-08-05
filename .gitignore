@@ -1,0 +1,6 @@
+# ingore folders
+realsense_env/
+
+
+#ignore file types
+*.db3
