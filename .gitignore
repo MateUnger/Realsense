@@ -4,3 +4,5 @@ realsense_env/
 
 #ignore file types
 *.db3
+*.npy
+*.avi
