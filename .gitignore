@@ -6,3 +6,7 @@ realsense_env/
 *.db3
 *.npy
 *.avi
+*.mp4
+*.raw
+*.json
+*.bin
