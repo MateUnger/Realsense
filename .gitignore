@@ -10,3 +10,5 @@ realsense_env/
 *.raw
 *.json
 *.bin
+*.png
+*.pyc
