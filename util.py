@@ -1,6 +1,224 @@
 import cv2
 import json
 import numpy as np
+import time
+import importlib
+from typing import Literal
+
+rtmlib_module = importlib.import_module("rtmlib")
+
+
+def create_ffmpeg_command(
+    width: int,
+    height: int,
+    fps: float,
+    encoder: Literal["h264_qsv", "h264_nvenc", "h264_amf", "libx264"],
+    out_filename: str,
+):
+    """
+    Create ffmpeg cmd command for video encoding
+
+    Args:
+        width: width of frame
+        height: height of frame
+        fps: sampling frequency of video
+        encoder: encoder to use ("h264_qsv"-Intel GPU, "h264_nvenc"-NVIDIA GPU, "h264_amf"-AMD GPU, "libx264"-CPU)
+
+    Returns:
+        ffmpeg: cmd command for ffmpeg
+    """
+    encoders = {
+        "h264_qsv": [
+            "-preset",
+            "veryfast",
+            "-global_quality",
+            "23",
+        ],
+        "h264_nvenc": [
+            "-preset",
+            "p1",
+            "-cq",
+            "23",
+        ],
+        "h264_amf": [
+            "-quality",
+            "speed",
+        ],
+        "libx264": [
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+        ],
+    }
+    # ffmpeg cmd command
+    ffmpeg = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        encoder,
+    ]
+    ffmpeg += encoders[encoder]
+    ffmpeg += ["-pix_fmt", "yuv420p", out_filename]
+
+    return ffmpeg
+
+
+# =========================================== POSE ESTIMATION ===========================================
+labels = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "top_head",
+    "neck",
+    "mid_hip",
+    "left_big_toe",
+    "right_big_toe",
+    "left_small_toe",
+    "right_small_toe",
+    "left_heel",
+    "right_heel",
+    "mid_shoulder",
+]
+
+
+class Custom:
+
+    def __init__(
+        self,
+        det_class: str = None,
+        det: str = None,
+        det_input_size: tuple = (640, 640),
+        pose_class: str = None,
+        pose: str = None,
+        pose_input_size: tuple = (192, 256),
+        mode: str = None,
+        to_openpose: bool = False,
+        backend: str = "onnxruntime",
+        device: str = "cuda",
+    ):
+
+        if det_class is not None:
+            try:
+                det_class = getattr(rtmlib_module, det_class)
+                self.det_model = det_class(
+                    det, model_input_size=det_input_size, backend=backend, device=device
+                )
+                self.one_stage = False
+
+            except ImportError:
+                raise ImportError(f"{det_class} is not supported by rtmlib.")
+        else:
+            self.one_stage = True
+
+        if pose_class is not None:
+            try:
+                pose_class = getattr(rtmlib_module, pose_class)
+                self.pose_model = pose_class(
+                    pose,
+                    model_input_size=pose_input_size,
+                    to_openpose=to_openpose,
+                    backend=backend,
+                    device=device,
+                )
+            except ImportError:
+                raise ImportError(f"{pose_class} is not supported by rtmlib.")
+
+    MODE = {
+        "performance": {
+            "det": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_x_8xb8-300e_humanart-a39d44ed.zip",  # noqa
+            "det_input_size": (640, 640),
+            "pose": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-x_simcc-body7_pt-body7_700e-384x288-71d7b7e9_20230629.zip",  # noqa
+            "pose_input_size": (288, 384),
+        },
+        "lightweight": {
+            "det": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_tiny_8xb8-300e_humanart-6f3252f9.zip",  # noqa
+            "det_input_size": (416, 416),
+            "pose": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-s_simcc-body7_pt-body7_420e-256x192-acd4a1ef_20230504.zip",  # noqa
+            "pose_input_size": (192, 256),
+        },
+        "balanced": {
+            "det": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip",  # noqa
+            "det_input_size": (640, 640),
+            "pose": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip",  # noqa
+            "pose_input_size": (192, 256),
+        },
+    }
+
+    RTMO_MODE = {
+        "performance": {
+            "pose": "https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-l_16xb16-600e_body7-640x640-b37118ce_20231211.zip",  # noqa
+            "pose_input_size": (640, 640),
+        },
+        "lightweight": {
+            "pose": "https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-s_8xb32-600e_body7-640x640-dac2bf74_20231211.zip",  # noqa
+            "pose_input_size": (640, 640),
+        },
+        "balanced": {
+            "pose": "https://download.openmmlab.com/mmpose/v1/projects/rtmo/onnx_sdk/rtmo-m_16xb16-600e_body7-640x640-39e78cc4_20231211.zip",  # noqa
+            "pose_input_size": (640, 640),
+        },
+    }
+
+    def __call__(self, image: np.ndarray):
+
+        if self.one_stage:
+            t0 = time.perf_counter()
+
+            keypoints, scores = self.pose_model(image)
+
+            t1 = time.perf_counter()
+
+            # print(f"RTMO: {(t1 - t0) * 1000:.2f} ms")
+
+        else:
+            t0 = time.perf_counter()
+
+            bboxes = self.det_model(image)
+
+            t1 = time.perf_counter()
+            # print("bboxes:", len(bboxes))
+            keypoints, scores = self.pose_model(image, bboxes=bboxes)
+
+            t2 = time.perf_counter()
+
+            # print(
+            #     f"DET: {(t1 - t0) * 1000:.2f} ms | "
+            #     f"POSE: {(t2 - t1) * 1000:.2f} ms | "
+            #     f"TOTAL: {(t2 - t0) * 1000:.2f} ms"
+            # )
+
+        return keypoints, scores
+
+
+# =========================================== CALIBRATION ===========================================
 
 
 class Pattern:
