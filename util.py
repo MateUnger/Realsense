@@ -4,6 +4,7 @@ import numpy as np
 import time
 import importlib
 from typing import Literal
+import pyrealsense2 as rs
 
 rtmlib_module = importlib.import_module("rtmlib")
 
@@ -75,6 +76,21 @@ def create_ffmpeg_command(
     ffmpeg += ["-pix_fmt", "yuv420p", out_filename]
 
     return ffmpeg
+
+
+def create_intrinsics_object(intrinsics_dict: dict) -> rs.intrinsics:
+    intrinsics_object = rs.intrinsics()
+
+    intrinsics_object.width = intrinsics_dict["width"]
+    intrinsics_object.height = intrinsics_dict["height"]
+    intrinsics_object.fx = intrinsics_dict["fx"]
+    intrinsics_object.fy = intrinsics_dict["fy"]
+    intrinsics_object.ppx = intrinsics_dict["ppx"]
+    intrinsics_object.ppy = intrinsics_dict["ppy"]
+    intrinsics_object.model = rs.distortion.inverse_brown_conrady
+    intrinsics_object.coeffs = intrinsics_dict["coeffs"]
+
+    return intrinsics_object
 
 
 # =========================================== POSE ESTIMATION ===========================================
