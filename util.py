@@ -93,6 +93,29 @@ def create_intrinsics_object(intrinsics_dict: dict) -> rs.intrinsics:
     return intrinsics_object
 
 
+def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -> float:
+    """
+    Samples the depth map using the median value of a patch (size radius+2).
+
+    Args:
+        depth_map: array of depth values in landscape orientation
+        x,y: center coords of sampling patch
+        radius: size of patch
+    Returns:
+        depth: median depth value of sampled patch (np.nan if no valid values)
+    """
+    h, w = depth_map.shape
+    x_min, x_max = max(0, x - radius), min(w, x + radius + 1)
+    y_min, y_max = max(0, y - radius), min(h, y + radius + 1)
+
+    ROI = depth_map[x_min:x_max, y_min:y_max]
+    valid = ROI[ROI > 0]
+
+    depth = float(np.median(valid)) if valid.size > 0 else np.nan
+
+    return depth
+
+
 # =========================================== POSE ESTIMATION ===========================================
 labels = [
     "nose",
