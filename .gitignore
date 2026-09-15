@@ -12,3 +12,4 @@ realsense_env/
 *.bin
 *.png
 *.pyc
+*.mkv
