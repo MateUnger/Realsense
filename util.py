@@ -280,48 +280,60 @@ class Pattern:
         self.pattern_points *= square_size
 
 
-def get_image_points(img, pattern_params: Pattern) -> tuple | None:
+def get_image_points(
+    calibration_image: np.ndarray, calibration_pattern: Pattern
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
-    Find corners of chessboard, approximate them (subpixel precision)
+    Find (inner) corners of chessboard calibration pattern, approximate them (subpixel precision)
 
     Args:
-        img: input image
-        pattern_params: parameters (height, width, ...) of the real world calibration pattern used
+        calibration_image: input image contaninig calibration pattern
+        calibration_pattern: parameters (height, width, ...) of the real world calibration pattern used
 
     Returns:
-        image_points, object_points arrays for the input image
+        image_points: array of coordinates of found inner corners of pattern
+        debug_image: image with found corners and origin visualized
     """
     found = False
     corners = 0
-    found, corners = cv2.findChessboardCorners(img, pattern_params.pattern_size)
+    found, corners = cv2.findChessboardCorners(
+        image=calibration_image, patternSize=calibration_pattern.pattern_size
+    )
     if found:
-        print(f"corners found: {len(corners)}")
-        term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 50, 0.1)
+        if corners.shape[0] != calibration_pattern.pattern_points.shape[0]:
+            print(
+                f"Not all corners found. Expected: {calibration_pattern.pattern_points.shape[0]}, found: {corners.shape[0]}"
+            )
+        termination_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 50, 0.1)
         # refine corners
-        cv2.cornerSubPix(img, corners, (5, 5), (-1, -1), term)
+        cv2.cornerSubPix(
+            image=calibration_image,
+            corners=corners,
+            winSize=(5, 5),
+            zeroZone=(-1, -1),
+            criteria=termination_criteria,
+        )
 
         # points in camera/image space
-        img_points = corners.reshape(-1, 2)
+        imgage_points = corners.reshape(-1, 2)
 
-        # points in real world
-        obj_points = pattern_params.pattern_points
     else:
         print("corners not found")
         return None
 
-    vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    cv2.drawChessboardCorners(vis, pattern_params.pattern_size, corners, found)
+    debug_image = cv2.cvtColor(calibration_image, cv2.COLOR_GRAY2BGR)
+    cv2.drawChessboardCorners(debug_image, calibration_pattern.pattern_size, corners, found)
 
     # draw real world origin on image
-    vis = cv2.circle(
-        vis,
-        (int(img_points[0][0]), int(img_points[0][1])),
+    debug_image = cv2.circle(
+        debug_image,
+        (int(imgage_points[0][0]), int(imgage_points[0][1])),
         10,
         (255, 0, 0),
         2,
     )
 
-    return img_points, obj_points, vis
+    return imgage_points, debug_image
 
 
 def get_extrinsics(calibration_img_path: str, debug_fig_path: str = None):
