@@ -116,9 +116,9 @@ def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -
     y_min, y_max = max(0, y - radius), min(h, y + radius + 1)
 
     ROI = depth_map[x_min:x_max, y_min:y_max]
-    valid = ROI[ROI > 0]
+    valid_ROI = ROI[ROI > 0]
 
-    depth = float(np.median(valid)) if valid.size > 0 else np.nan
+    depth = float(np.nanmedian(valid_ROI)) if valid_ROI.size > 0 else np.nan
 
     return depth
 
@@ -273,8 +273,8 @@ class Pattern:
     """
 
     def __init__(self, height, width, square_size):
-        self.pattern_height = height
-        self.pattern_width = width
+        self.pattern_height = height  # number of INNER corners height wise
+        self.pattern_width = width  # number of INNER corners width wise
         self.square_size = float(square_size)  # in world coordinate system (m,mm,...)
         self.pattern_type = "chessboard"
         self.pattern_size = (
