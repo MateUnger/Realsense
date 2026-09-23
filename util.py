@@ -8,6 +8,13 @@ import pyrealsense2 as rs
 
 rtmlib_module = importlib.import_module("rtmlib")
 
+# resolution-fps pairs that work with both color and depth
+resolution_presets = {
+    "848x480@60": {"width": 848, "height": 480, "fps": 60},
+    "640x360@90": {"width": 640, "height": 360, "fps": 90},
+    "480x270@90": {"width": 480, "height": 270, "fps": 90},
+}
+
 
 def create_ffmpeg_command(
     width: int,
