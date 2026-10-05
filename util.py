@@ -5,6 +5,14 @@ import time
 import importlib
 from typing import Literal
 import pyrealsense2 as rs
+import numpy as np
+import os
+import json
+import matplotlib.pyplot as plt
+
+from scipy.signal import find_peaks, peak_widths
+from scipy.ndimage import maximum_filter1d
+from scipy.interpolate import CubicSpline, PchipInterpolator
 
 rtmlib_module = importlib.import_module("rtmlib")
 
@@ -154,6 +162,23 @@ labels = [
     "right_heel",
     "mid_shoulder",
 ]
+
+
+def hex_to_bgr(hex_color: str) -> tuple:
+    """
+    Convert hex color to BGR format (for cv2)
+
+    Args:
+        hex_color: color in hex format
+
+    Returns:
+        bgr_color: same color in bgr format
+    """
+    hex_color = hex_color.lstrip("#")
+    r, g, b = tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+
+    bgr_color = (b, g, r)
+    return bgr_color
 
 
 class Custom:
@@ -405,3 +430,323 @@ def get_extrinsics(calibration_img_path: str, debug_fig_path: str = None):
         print(f"{calibration_img_path}... FAILED")
 
     return R, t_vec, rvec
+
+
+import math
+import numpy as np
+from scipy.interpolate import CubicSpline
+import copy
+
+
+import numpy as np
+from OneEuroFilter import OneEuroFilter
+
+
+def filter_keypoints(keypoints: np.ndarray, fps: float):
+    n_frames, n_keypoints, n_dims = keypoints.shape
+
+    # One filter for each keypoint and each XYZ coordinate
+    filters = [
+        [OneEuroFilter(freq=fps, mincutoff=1, beta=0.1, dcutoff=1.0) for _ in range(n_dims)]
+        for _ in range(n_keypoints)
+    ]
+
+    filtered = np.empty_like(keypoints, dtype=float)
+
+    for frame_idx in range(n_frames):
+        timestamp = frame_idx / fps
+
+        for kpt_idx in range(n_keypoints):
+            for xyz in range(n_dims):
+                filtered[frame_idx, kpt_idx, xyz] = filters[kpt_idx][xyz].filter(
+                    keypoints[frame_idx, kpt_idx, xyz], timestamp
+                )
+
+    return filtered
+
+
+from scipy.signal import butter, filtfilt
+
+
+def lowpass_keypoints(keypoints, fps, cutoff=2.0, order=4):
+    """
+    keypoints: (n_frames, n_keypoints, 3)
+    """
+    nyquist = fps / 2
+    normal_cutoff = cutoff / nyquist
+
+    b, a = butter(order, normal_cutoff, btype="low")
+
+    filtered = filtfilt(b, a, keypoints, axis=0)
+
+    return filtered
+
+
+# def filter_2d_keypoints(keypoints_2d: np.ndarray, kpt_idx: int, fps: float):
+#     og = copy.copy(keypoints_2d[:, kpt_idx, :])
+#     keypoints_2d_filtered = filter_keypoints(keypoints=keypoints_2d, fps=fps)
+
+#     kpt_coords = copy.copy(keypoints_2d_filtered[:, kpt_idx, :])
+
+#     movement = np.linalg.norm(
+#         np.diff(
+#             kpt_coords,
+#             axis=0,
+#             prepend=np.expand_dims(kpt_coords[0, :], axis=0),
+#         ),
+#         axis=1,
+#     )
+
+#     std = np.std(movement)
+
+#     # Find peaks to remove jerky outliers
+#     min_peak_height = std * 2
+#     min_peak_distance = fps * 0.05
+#     prominance = 2 * std
+
+#     peaks, peak_properties = find_peaks(
+#         movement,
+#         height=min_peak_height,
+#         distance=min_peak_distance,
+#         prominence=prominance,
+#     )
+
+#     widths, width_heights, left_ips, right_ips = peak_widths(
+#         x=movement,
+#         peaks=peaks,
+#         rel_height=0.95,
+#     )
+
+#     frames = np.arange(len(kpt_coords))
+
+#     # Remove all detected spike regions from both x and y
+#     for left, right in zip(left_ips, right_ips):
+#         start = math.floor(left)
+#         end = math.ceil(right)
+#         kpt_coords[start : end + 1, :] = np.nan
+
+#     # Find short valid segments between NaN regions
+#     not_nan = ~np.isnan(kpt_coords[:, 0])
+
+#     diff = np.diff(not_nan.astype(int))
+#     starts = np.where(diff == 1)[0] + 1
+#     ends = np.where(diff == -1)[0] + 1
+
+#     if not_nan[0]:
+#         starts = np.r_[0, starts]
+
+#     if not_nan[-1]:
+#         ends = np.r_[ends, len(not_nan)]
+
+#     # Remove short valid segments
+#     for start, end in zip(starts, ends):
+#         surrounded_by_nan = (
+#             start > 0 and end < len(not_nan) and not not_nan[start - 1] and not not_nan[end]
+#         )
+
+#         if surrounded_by_nan and end - start < fps * 0.25:
+#             kpt_coords[start:end, :] = np.nan
+
+#     # Cubic spline interpolation
+#     for dim in range(2):
+#         coordinate = kpt_coords[:, dim]
+#         not_nan = ~np.isnan(coordinate)
+
+#         spline = CubicSpline(
+#             frames[not_nan],
+#             coordinate[not_nan],
+#         )
+
+#         coordinate[~not_nan] = spline(frames[~not_nan])
+
+#         keypoints_2d_filtered[:, kpt_idx, dim] = coordinate
+
+#     keypoints_2d_filtered = lowpass_keypoints(keypoints_2d_filtered, fps, 2, 4)
+
+#     fig, axs = plt.subplots(3, 1, figsize=(15, 7))
+
+#     axs[0].set_title("shoulders")
+#     axs[0].plot(og)
+
+#     axs[1].set_title("movement")
+#     axs[1].plot(movement)
+#     axs[1].plot(peaks, movement[peaks], "r*", markersize=4)
+#     axs[1].hlines(min_peak_height, 0, movement.shape[0])
+#     axs[1].plot(left_ips, width_heights, "o", label="turn start", markersize=4)
+#     axs[1].plot(right_ips, width_heights, "o", label="turn end", markersize=4)
+#     axs[1].set_ylim([-5, 50])
+
+#     axs[2].plot(keypoints_2d_filtered[:, kpt_idx, :])
+#     axs[2].set_title("shoulders filtered")
+
+#     for ax in axs[:-2]:
+#         ax.set_xticks([])
+#         ax.grid()
+
+#     plt.tight_layout()
+
+
+def filter_2d_keypoints(
+    keypoints_2d: np.ndarray,
+    fps: float,
+    plot_kpt_idx: int | None = None,
+):
+    keypoints_2d_filtered = filter_keypoints(
+        keypoints=keypoints_2d,
+        fps=fps,
+    ).copy()
+
+    n_keypoints = keypoints_2d_filtered.shape[1]
+
+    # Store plotting data for the requested keypoint
+    plot_data = None
+
+    for kpt_idx in range(n_keypoints):
+        og = keypoints_2d_filtered[:, kpt_idx, :].copy()
+        kpt_coords = og.copy()
+
+        movement = np.linalg.norm(
+            np.diff(
+                kpt_coords,
+                axis=0,
+                prepend=np.expand_dims(kpt_coords[0, :], axis=0),
+            ),
+            axis=1,
+        )
+
+        std = np.std(movement)
+
+        # Find peaks to remove jerky outliers
+        min_peak_height = std * 2
+        min_peak_distance = int(fps * 0.05)
+        prominance = 2 * std
+
+        peaks, _ = find_peaks(
+            movement,
+            height=min_peak_height,
+            distance=min_peak_distance,
+            prominence=prominance,
+        )
+
+        _, width_heights, left_ips, right_ips = peak_widths(
+            x=movement,
+            peaks=peaks,
+            rel_height=0.95,
+        )
+
+        frames = np.arange(len(kpt_coords))
+
+        # Remove all detected spike regions
+        for left, right in zip(left_ips, right_ips):
+            start = math.floor(left)
+            end = math.ceil(right)
+
+            kpt_coords[start : end + 1, :] = np.nan
+
+        # Find short valid segments between NaN regions
+        not_nan = ~np.isnan(kpt_coords[:, 0])
+
+        diff = np.diff(not_nan.astype(int))
+
+        starts = np.where(diff == 1)[0] + 1
+        ends = np.where(diff == -1)[0] + 1
+
+        if not_nan[0]:
+            starts = np.r_[0, starts]
+
+        if not_nan[-1]:
+            ends = np.r_[ends, len(not_nan)]
+
+        # Remove short valid segments
+        for start, end in zip(starts, ends):
+            surrounded_by_nan = (
+                start > 0 and end < len(not_nan) and not not_nan[start - 1] and not not_nan[end]
+            )
+
+            if surrounded_by_nan and end - start < fps * 0.25:
+                kpt_coords[start:end, :] = np.nan
+
+        # Cubic spline interpolation
+        for dim in range(2):
+            coordinate = kpt_coords[:, dim]
+            not_nan = ~np.isnan(coordinate)
+
+            if np.sum(not_nan) < 4:
+                continue
+
+            spline = CubicSpline(
+                frames[not_nan],
+                coordinate[not_nan],
+            )
+
+            coordinate[~not_nan] = spline(frames[~not_nan])
+
+            keypoints_2d_filtered[:, kpt_idx, dim] = coordinate
+
+        # Save plotting data for selected keypoint
+        if kpt_idx == plot_kpt_idx:
+            plot_data = {
+                "og": og,
+                "movement": movement,
+                "peaks": peaks,
+                "min_peak_height": min_peak_height,
+                "left_ips": left_ips,
+                "right_ips": right_ips,
+                "width_heights": width_heights,
+            }
+
+    # Low-pass filter all keypoints
+    keypoints_2d_filtered = lowpass_keypoints(
+        keypoints_2d_filtered,
+        fps,
+        2,
+        4,
+    )
+
+    # Plot selected keypoint
+    if plot_kpt_idx is not None and plot_data is not None:
+        fig, axs = plt.subplots(3, 1, figsize=(15, 7))
+
+        axs[0].set_title(f"Keypoint {plot_kpt_idx}")
+        axs[0].plot(plot_data["og"])
+
+        axs[1].set_title("movement")
+        axs[1].plot(plot_data["movement"])
+        axs[1].plot(
+            plot_data["peaks"],
+            plot_data["movement"][plot_data["peaks"]],
+            "r*",
+            markersize=4,
+        )
+        axs[1].hlines(
+            plot_data["min_peak_height"],
+            0,
+            plot_data["movement"].shape[0],
+        )
+        axs[1].plot(
+            plot_data["left_ips"],
+            plot_data["width_heights"],
+            "o",
+            label="turn start",
+            markersize=4,
+        )
+        axs[1].plot(
+            plot_data["right_ips"],
+            plot_data["width_heights"],
+            "o",
+            label="turn end",
+            markersize=4,
+        )
+        axs[1].set_ylim([-5, 50])
+
+        axs[2].plot(keypoints_2d_filtered[:, plot_kpt_idx, :])
+        axs[2].set_title(f"Keypoint {plot_kpt_idx} filtered")
+
+        for ax in axs[:-2]:
+            ax.set_xticks([])
+            ax.grid()
+
+        plt.tight_layout()
+        plt.show()
+
+    return keypoints_2d_filtered
