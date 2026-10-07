@@ -646,3 +646,53 @@ def filter_2d_keypoints(
         plt.show()
 
     return keypoints_2d_filtered
+
+
+def interpolate_gaps(keypoints: np.ndarray, fps: int, max_gap: float) -> np.ndarray:
+    """
+    Fills gaps below max_gap size along each dimension (1D) of the input array.
+    Args:
+        keypoints (np.ndarray):  Input data with shape (n_keypoints, n_dims, n_frames).
+        fps (int):          Frames per second of the data.
+        max_gap (float):    Maximum gap size in seconds
+
+
+    """
+    # n_keypoints, n_dims, n_frames = keypoints.shape
+    n_frames, n_keypoints, n_dims = keypoints.shape
+    max_gap_frames = int(max_gap * fps)
+
+    filled_data = np.copy(keypoints)  # Preserve original data
+
+    for kpt in range(n_keypoints):
+        for dim in range(n_dims):
+            signal = keypoints[:, kpt, dim]
+            nan_indices = np.where(np.isnan(signal))[0]
+
+            if len(nan_indices) == 0:
+                continue
+
+            # Identify NaN segments
+            diff = np.diff(nan_indices)
+            segment_starts = np.insert(nan_indices[np.where(diff > 1)[0] + 1], 0, nan_indices[0])
+            segment_ends = np.append(nan_indices[np.where(diff > 1)[0]], nan_indices[-1])
+
+            # Interpolate gaps within the allowed size
+            for start, end in zip(segment_starts, segment_ends):
+                gap_size = end - start + 1
+                if gap_size <= max_gap_frames:
+
+                    valid_indices = np.where(~np.isnan(signal))[0]
+                    # fit cubic spline if there are enough points
+                    if len(valid_indices) >= 2:
+                        cs = CubicSpline(valid_indices, signal[valid_indices])
+                        filled_data[start : end + 1, kpt, dim] = cs(np.arange(start, end + 1))
+
+                    # use linear interpolation if not enough valid points
+                    else:
+                        non_nan_idx = np.where(~np.isnan(signal))[0]
+                        filled_data[:, kpt, dim] = np.interp(
+                            np.arange(n_frames), non_nan_idx, signal[non_nan_idx]
+                        )
+
+    return filled_data
