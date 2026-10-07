@@ -442,7 +442,7 @@ import numpy as np
 from OneEuroFilter import OneEuroFilter
 
 
-def filter_keypoints(keypoints: np.ndarray, fps: float):
+def filter_keypoints_euro(keypoints: np.ndarray, fps: float):
     n_frames, n_keypoints, n_dims = keypoints.shape
 
     # One filter for each keypoint and each XYZ coordinate
@@ -487,7 +487,7 @@ def filter_2d_keypoints(
     fps: float,
     plot_kpt_idx: int | None = None,
 ):
-    keypoints_2d_filtered = filter_keypoints(
+    keypoints_2d_filtered = filter_keypoints_euro(
         keypoints=keypoints_2d,
         fps=fps,
     ).copy()
