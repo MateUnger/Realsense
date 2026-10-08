@@ -684,11 +684,29 @@ def interpolate_gaps(keypoints: np.ndarray, fps: int, max_gap: float) -> np.ndar
                     # use linear interpolation if not enough valid points
                     else:
                         non_nan_idx = np.where(~np.isnan(signal))[0]
+                        if non_nan_idx.size == 0:
+                            continue
+
                         filled_data[:, kpt, dim] = np.interp(
                             np.arange(n_frames), non_nan_idx, signal[non_nan_idx]
                         )
 
     return filled_data
+
+
+def get_basename(full_file_path: str) -> str:
+    """
+    Return the basename of input file path e.g.: ...folder1/folder2/image_name.png -> image_name
+
+    Args:
+        full_file_path: input file path string
+
+    Returns:
+        basename: basename of the input (without folders or extension)
+    """
+    basename_without_ext = os.path.splitext(full_file_path)[0]
+    basename = os.path.basename(basename_without_ext)
+    return basename
 
 
 def get_qualisys_metadata(filename: str) -> dict:
@@ -756,6 +774,10 @@ def format_qualisys_export(
     # Read the TSV file, skipping the first 10 rows (only metadata)
     df = pd.read_csv(input_filename, sep="\t", header=None, skiprows=11, dtype=None)
 
+    # TODO: find out why is is there at all
+    # drop last column since it is empty
+    df = df.drop(df.columns[[-1]], axis=1)
+
     # Convert the DataFrame to a numpy array, transpose it (so it is (markers x dims) x frames)
     keypoints = df.to_numpy()[1:, :92].T
 
@@ -785,8 +807,8 @@ def format_qualisys_export(
     keypoints = keypoints / 1000
 
     # calculate mid_hip_front keypoint
-    left_hip_front = keypoints[labels.index("left_hip_front"), :, :]
-    right_hip_front = keypoints[labels.index("right_hip_front"), :, :]
+    left_hip_front = keypoints[labels.index("left_hip"), :, :]
+    right_hip_front = keypoints[labels.index("right_hip"), :, :]
     mid_hip_front = np.mean((left_hip_front, right_hip_front), axis=0)
 
     # calculate mid_hip_back keypoint
@@ -809,3 +831,61 @@ def format_qualisys_export(
 
     # np.savez(output_filename, keypoints=keypoints, labels=labels)
     return keypoints, labels
+
+
+def filter_data(
+    data: np.ndarray,
+    sampling_rate: float,
+    filter_type: Literal["lowpass", "bandpass"],
+    cutoff: list,
+    order: int,
+    gap_size: int,
+) -> np.ndarray:
+    """
+    Interpolates and applies filter to data (with NaNs).
+
+    Args:
+        data (np.ndarray):      Input data with shape (n_kpt, n_dims, n_frames).
+        sampling_rate (float):  Sampling rate of the data.
+        cutoff (float):         Cutoff frequency for the low-pass filter.
+        order (int):            Order of the Butterworth filter.
+        gap_size (int):         Maximum size (in seconds) of gaps to fill
+
+    Returns:
+        filtered_data (np.ndarray): Interpolated and filtered data with the origianl Nan values in place.
+
+    """
+    n_kpt, n_dims, n_frames = data.shape
+    data = interpolate_gaps(data, sampling_rate, gap_size)  # Fill short gaps
+    filtered_data = copy.deepcopy(data)
+
+    match filter_type:
+        case "lowpass":
+            cutoff = cutoff[0]
+        case "bandpass":
+            cutoff = np.asarray(cutoff)
+    # Design Butterworth low-pass filter
+    b, a = butter(N=order, Wn=cutoff, btype=filter_type, analog=False, fs=sampling_rate)
+
+    for kpt in range(n_kpt):
+        for dim in range(n_dims):
+            trajectory = data[kpt, dim, :]
+
+            # search for NaNs
+            nans = np.isnan(trajectory)
+
+            # if there are nans, interpolate the missing values for subsequent filtering
+            if np.any(nans):
+                valid_indices = ~nans
+                trajectory[nans] = np.interp(
+                    np.flatnonzero(nans),
+                    np.flatnonzero(valid_indices),
+                    trajectory[valid_indices],
+                )
+
+            trajectory = filtfilt(b, a, trajectory)  # Apply filter
+            trajectory[nans] = np.nan  # Restore NaNs
+
+            filtered_data[kpt, dim, :] = trajectory
+
+    return filtered_data
