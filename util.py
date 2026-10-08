@@ -26,6 +26,36 @@ resolution_presets = {
     "480x270@90": {"width": 480, "height": 270, "fps": 90},
 }
 
+stereo_labels = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "top_head",
+    "neck",
+    "mid_hip",
+    "left_big_toe",
+    "right_big_toe",
+    "left_small_toe",
+    "right_small_toe",
+    "left_heel",
+    "right_heel",
+    "mid_shoulder",
+]
+
 
 def create_ffmpeg_command(
     width: int,
@@ -889,3 +919,25 @@ def filter_data(
             filtered_data[kpt, dim, :] = trajectory
 
     return filtered_data
+
+
+def load_keypoints_and_labels(npz_data_path: str) -> tuple[np.ndarray, list]:
+    """
+    Load keypoint and label data from .npz file
+    File has to have keys: "keypoints", "labels"
+
+    Args:
+        npz_data_path: path to the .npz file
+
+    Returns:
+        keypoints: loaded keypoint data as np.array
+        labels: loaded labels as list
+    """
+    if os.path.exists(npz_data_path):
+        loaded_data = np.load(npz_data_path)
+        keypoints = loaded_data["keypoints"]
+        labels = loaded_data["labels"].tolist()
+        print(f"loaded data from: {npz_data_path} with keys: {[key for key in loaded_data.keys()]}")
+    else:
+        raise FileNotFoundError(f"File: {npz_data_path} does not exist!")
+    return keypoints, labels
