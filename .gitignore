@@ -13,3 +13,4 @@ realsense_env/
 *.png
 *.pyc
 *.mkv
+*.tsv

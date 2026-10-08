@@ -5,11 +5,14 @@ import time
 import importlib
 from typing import Literal
 import pyrealsense2 as rs
-import numpy as np
 import os
-import json
 import matplotlib.pyplot as plt
-
+import pandas as pd
+import csv
+import math
+from scipy.interpolate import CubicSpline
+import copy
+from OneEuroFilter import OneEuroFilter
 from scipy.signal import find_peaks, peak_widths
 from scipy.ndimage import maximum_filter1d
 from scipy.interpolate import CubicSpline, PchipInterpolator
@@ -432,16 +435,6 @@ def get_extrinsics(calibration_img_path: str, debug_fig_path: str = None):
     return R, t_vec, rvec
 
 
-import math
-import numpy as np
-from scipy.interpolate import CubicSpline
-import copy
-
-
-import numpy as np
-from OneEuroFilter import OneEuroFilter
-
-
 def filter_keypoints_euro(keypoints: np.ndarray, fps: float):
     n_frames, n_keypoints, n_dims = keypoints.shape
 
@@ -696,3 +689,123 @@ def interpolate_gaps(keypoints: np.ndarray, fps: int, max_gap: float) -> np.ndar
                         )
 
     return filled_data
+
+
+def get_qualisys_metadata(filename: str) -> dict:
+    """
+    Read qualisys export file in .tsv format, parse metadata.
+    Exported file has to include tsv-header (qualisys export setting).
+
+    Args:
+        filename: path to the qualisys export file in .tsv format
+
+    Returns:
+        qualisys_metadata: metadata in dict format
+    """
+
+    qualisys_metadata = {}
+    with open(filename) as f:
+        # read file with csv reader. no need for pandas for just a few lines
+        reader = csv.reader(f, delimiter="\t", quotechar='"')
+
+        for ind, row in enumerate(reader):
+            # only the first 9 rows of the whole file contain the tsv header metadata
+            if ind <= 8:
+                if ind < 6:
+                    qualisys_metadata[row[0]] = float(row[1])
+                # this row has 2 pieces of info; timestamp of the recording from qualisys (this cant be used for sync), timestamp from the start of host system
+                elif ind == 7:
+                    qualisys_metadata[row[0] + "_QUALISYS"] = row[1]
+                    qualisys_metadata[row[0] + "_FROM_SYSTEM_START"] = row[2]
+                else:
+                    qualisys_metadata[row[0]] = row[1]
+            if ind == 9:
+                qualisys_metadata["marker_names"] = row[1:]
+
+    return qualisys_metadata
+
+
+def format_qualisys_export(
+    input_filename: str, output_filename: str = None
+) -> tuple[np.ndarray, list]:
+    # TODO: add logging, maybe return value
+    """
+    Read qualisys export file in .tsv format, format contents to fit multidimensional np.array,
+    delete gap-filled entries and convert measurements from milimeter to meter.
+
+    Args:
+        input_filename: path to input file (.tsv)
+        output_filename: optional, path to save the result as a .npz file. Default is the input_filename directory.
+
+    Returns:
+        keypoints: np.array of keypoint data
+        labels: keypoint labels as list
+    """
+    if not os.path.exists(input_filename):
+        raise FileNotFoundError(f"File {input_filename} does not exits")
+
+    elif output_filename == None:
+        basename = get_basename(input_filename)
+        directory = os.path.dirname(input_filename)
+        output_filename = os.path.join(directory, f"qualisys.npz")
+
+    # read first 10 rows to get number of markers, frames, marker names...
+    metadata = get_qualisys_metadata(input_filename)
+    labels = metadata["marker_names"]
+
+    # Read the TSV file, skipping the first 10 rows (only metadata)
+    df = pd.read_csv(input_filename, sep="\t", header=None, skiprows=11, dtype=None)
+
+    # Convert the DataFrame to a numpy array, transpose it (so it is (markers x dims) x frames)
+    keypoints = df.to_numpy()[1:, :92].T
+
+    # reshape the data to    markers x dims x frames
+    keypoints = keypoints.reshape(int(metadata["NO_OF_MARKERS"]), 4, int(metadata["NO_OF_FRAMES"]))
+
+    # iterate over all keypoints
+    for kpt_idx, keypoint in enumerate(keypoints):
+        # get the type of measurement for all frames of a given keypoint
+        measurement_types = keypoint[3, :]
+        # iterate over all dims (x,y,z,type) of a keypoint
+        for dim_idx, dim in enumerate(keypoint):
+
+            # replace coordinates with nan when it is gap-filled by qualisys, convert coords to float
+            if dim_idx <= 2:
+                keypoints[kpt_idx, dim_idx, :] = np.where(
+                    measurement_types == "Measured", dim, "Nan"
+                ).astype(float)
+
+            # leave type as str ('Measured' or 'Gap-filled')
+            elif dim_idx == 3:
+                pass
+    # remove dim 3 (type of measurement)
+    keypoints = keypoints[:, :3, :].astype(float)
+
+    # convert from milimeters to meters
+    keypoints = keypoints / 1000
+
+    # calculate mid_hip_front keypoint
+    left_hip_front = keypoints[labels.index("left_hip_front"), :, :]
+    right_hip_front = keypoints[labels.index("right_hip_front"), :, :]
+    mid_hip_front = np.mean((left_hip_front, right_hip_front), axis=0)
+
+    # calculate mid_hip_back keypoint
+    # left_hip_back = keypoints[labels.index("left_hip_back"), :, :]
+    # right_hip_back = keypoints[labels.index("right_hip_back"), :, :]
+    # mid_hip_back = np.mean((left_hip_back, right_hip_back), axis=0)
+
+    # calculate mid_shoulder front keypoint
+    left_shoulder = keypoints[labels.index("left_shoulder"), :]
+    right_shoulder = keypoints[labels.index("right_shoulder"), :]
+    mid_shoulder = np.mean((left_shoulder, right_shoulder), axis=0)
+
+    # add new keypoints and labels to existing keypoints and labels
+    keypoints = np.concatenate((keypoints, mid_shoulder[np.newaxis, :, :]), axis=0)
+    # keypoints = np.concatenate((keypoints, mid_hip_back[np.newaxis, :, :]), axis=0)
+    keypoints = np.concatenate((keypoints, mid_hip_front[np.newaxis, :, :]), axis=0)
+    labels.append("mid_shoulder")
+    # labels.append("mid_hip_back")
+    labels.append("mid_hip")
+
+    # np.savez(output_filename, keypoints=keypoints, labels=labels)
+    return keypoints, labels
