@@ -13,7 +13,7 @@ import math
 from scipy.interpolate import CubicSpline
 import copy
 from OneEuroFilter import OneEuroFilter
-from scipy.signal import find_peaks, peak_widths
+from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt
 from scipy.ndimage import maximum_filter1d
 from scipy.interpolate import CubicSpline, PchipInterpolator
 
@@ -920,23 +920,70 @@ def filter_data(
     return filtered_data
 
 
-def load_keypoints_and_labels(npz_data_path: str) -> tuple[np.ndarray, list]:
+def _valid_runs(valid: np.ndarray):
+    """Yield (start, end) of contiguous True runs (end exclusive)."""
+    d = np.diff(np.concatenate(([0], valid.astype(np.int8), [0])))
+    return zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1))
+
+
+def filter_keypoints(
+    keypoints: np.ndarray,
+    sampling_rate: float,
+    cutoff: float,
+    order: int,
+    gap_size: float,
+) -> np.ndarray:
+    """
+    Fills short gaps, then applies a zero-phase Butterworth filter to each
+    contiguous run of valid samples. Remaining NaNs (long gaps) are kept.
+
+    Args:
+        data: shape (n_kpt, n_dims, n_frames)
+        sampling_rate: Hz
+        filter_type: "lowpass" (uses cutoff[0]) or "bandpass" (uses cutoff[:2])
+        cutoff: cutoff frequencies in Hz
+        order: Butterworth order (effective order is doubled by filtfilt)
+        gap_size: maximum gap (seconds) to interpolate
+    """
+    wn = cutoff
+
+    if np.max(wn) >= sampling_rate / 2:
+        raise ValueError("cutoff must be below the Nyquist frequency")
+
+    sos = butter(order, wn, btype="lowpass", fs=sampling_rate, output="sos")
+    min_len = 3 * (2 * sos.shape[0] + 1) + 1  # safe lower bound for sosfiltfilt padding
+
+    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
+    filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
+
+    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
+        trajectory = keypoints[kpt, dim]
+        for start, end in _valid_runs(~np.isnan(trajectory)):
+            if end - start >= min_len:
+                filtered[kpt, dim, start:end] = sosfiltfilt(sos, trajectory[start:end])
+            else:
+                filtered[kpt, dim, start:end] = np.nan  # too short to filter reliably
+
+    return filtered
+
+
+def load_keypoints_and_labels(filename: str) -> tuple[np.ndarray, list]:
     """
     Load keypoint and label data from .npz file
     File has to have keys: "keypoints", "labels"
 
     Args:
-        npz_data_path: path to the .npz file
+        filename: path to the .npz file
 
     Returns:
         keypoints: loaded keypoint data as np.array
         labels: loaded labels as list
     """
-    if os.path.exists(npz_data_path):
-        loaded_data = np.load(npz_data_path)
+    if os.path.exists(filename):
+        loaded_data = np.load(filename)
         keypoints = loaded_data["keypoints"]
         labels = loaded_data["labels"].tolist()
-        print(f"loaded data from: {npz_data_path} with keys: {[key for key in loaded_data.keys()]}")
+        print(f"loaded data from: {filename} with keys: {[key for key in loaded_data.keys()]}")
     else:
-        raise FileNotFoundError(f"File: {npz_data_path} does not exist!")
+        raise FileNotFoundError(f"File: {filename} does not exist!")
     return keypoints, labels
