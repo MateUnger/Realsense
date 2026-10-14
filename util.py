@@ -13,7 +13,7 @@ import math
 from scipy.interpolate import CubicSpline
 import copy
 from OneEuroFilter import OneEuroFilter
-from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt
+from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt, filtfilt
 from scipy.ndimage import maximum_filter1d
 from scipy.interpolate import CubicSpline, PchipInterpolator
 
@@ -322,6 +322,66 @@ class Custom:
         return keypoints, scores
 
 
+models = {
+    "detectors": {
+        "yolo_nano": {
+            "input_size": [416, 416],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_nano_8xb8-300e_humanart-40f6f0d0.zip",
+        },
+        "yolo_m": {
+            "input_size": [640, 640],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip",
+        },
+        "yolo_l": {
+            "input_size": [640, 640],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_l_8xb8-300e_humanart-ce1d7a62.zip",
+        },
+        "yolo_x": {
+            "input_size": [640, 640],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_x_8xb8-300e_humanart-a39d44ed.zip",
+        },
+    },
+    "pose": {
+        "rtm_pose_t_17": {
+            "input_size": [192, 256],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-t_simcc-body7_pt-body7_420e-256x192-026a1439_20230504.zip",
+        },
+        "rtm_pose_m_17": {
+            "input_size": [192, 256],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip",
+        },
+        "rtm_pose_l_17": {
+            "input_size": [288, 384],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-l_simcc-body7_pt-body7_420e-384x288-3f5a1437_20230504.zip",
+        },
+        "rtm_pose_x_17": {
+            "input_size": [288, 384],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-x_simcc-body7_pt-body7_700e-384x288-71d7b7e9_20230629.zip",
+        },
+        "vit_pose_l_17": {
+            "input_size": [192, 256],
+            "path": "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/coco/vitpose-l-coco.onnx",
+        },
+        "rtm_pose_t_26": {
+            "input_size": [192, 256],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-t_simcc-body7_pt-body7-halpe26_700e-256x192-6020f8a6_20230605.zip",
+        },
+        "rtm_pose_m_26": {
+            "input_size": [288, 384],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.zip",
+        },
+        "rtm_pose_l_26": {
+            "input_size": [288, 384],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-l_simcc-body7_pt-body7-halpe26_700e-256x192-2abb7558_20230605.zip",
+        },
+        "rtm_pose_x_26": {
+            "input_size": [288, 384],
+            "path": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-x_simcc-body7_pt-body7-halpe26_700e-384x288-7fb6e239_20230606.zip",
+        },
+    },
+}
+
+
 # =========================================== CALIBRATION ===========================================
 
 
@@ -485,9 +545,6 @@ def filter_keypoints_euro(keypoints: np.ndarray, fps: float):
                 )
 
     return filtered
-
-
-from scipy.signal import butter, filtfilt
 
 
 def lowpass_keypoints(
@@ -676,59 +733,6 @@ def filter_2d_keypoints(
     return keypoints_2d_filtered
 
 
-# def interpolate_gaps(keypoints: np.ndarray, fps: int, max_gap: float) -> np.ndarray:
-#     """
-#     Fills gaps below max_gap size along each dimension (1D) of the input array.
-#     Args:
-#         keypoints (np.ndarray):  Input data with shape (n_keypoints, n_dims, n_frames).
-#         fps (int):          Frames per second of the data.
-#         max_gap (float):    Maximum gap size in seconds
-
-
-#     """
-#     # n_keypoints, n_dims, n_frames = keypoints.shape
-#     n_frames, n_keypoints, n_dims = keypoints.shape
-#     max_gap_frames = int(max_gap * fps)
-
-#     filled_data = np.copy(keypoints)  # Preserve original data
-
-#     for kpt in range(n_keypoints):
-#         for dim in range(n_dims):
-#             signal = keypoints[:, kpt, dim]
-#             nan_indices = np.where(np.isnan(signal))[0]
-
-#             if len(nan_indices) == 0:
-#                 continue
-
-#             # Identify NaN segments
-#             diff = np.diff(nan_indices)
-#             segment_starts = np.insert(nan_indices[np.where(diff > 1)[0] + 1], 0, nan_indices[0])
-#             segment_ends = np.append(nan_indices[np.where(diff > 1)[0]], nan_indices[-1])
-
-#             # Interpolate gaps within the allowed size
-#             for start, end in zip(segment_starts, segment_ends):
-#                 gap_size = end - start + 1
-#                 if gap_size <= max_gap_frames:
-
-#                     valid_indices = np.where(~np.isnan(signal))[0]
-#                     # fit cubic spline if there are enough points
-#                     if len(valid_indices) >= 2:
-#                         cs = CubicSpline(valid_indices, signal[valid_indices])
-#                         filled_data[start : end + 1, kpt, dim] = cs(np.arange(start, end + 1))
-
-#                     # use linear interpolation if not enough valid points
-#                     else:
-#                         non_nan_idx = np.where(~np.isnan(signal))[0]
-#                         if non_nan_idx.size == 0:
-#                             continue
-
-#                         filled_data[:, kpt, dim] = np.interp(
-#                             np.arange(n_frames), non_nan_idx, signal[non_nan_idx]
-#                         )
-
-#     return filled_data
-
-
 def interpolate_gaps(keypoints: np.ndarray, fps: float, max_gap: float) -> np.ndarray:
     """
     Fill interior NaN gaps of at most `max_gap` seconds, independently per
@@ -903,6 +907,8 @@ def format_qualisys_export(
     keypoints = np.concatenate((keypoints, mid_shoulder[np.newaxis, :, :]), axis=0)
     # keypoints = np.concatenate((keypoints, mid_hip_back[np.newaxis, :, :]), axis=0)
     keypoints = np.concatenate((keypoints, mid_hip_front[np.newaxis, :, :]), axis=0)
+
+    keypoints = keypoints.transpose(2, 0, 1)
     labels.append("mid_shoulder")
     # labels.append("mid_hip_back")
     labels.append("mid_hip")
@@ -977,7 +983,7 @@ def get_segment_borders(valid: np.ndarray):
     return zip(np.flatnonzero(diff == 1), np.flatnonzero(diff == -1))
 
 
-def filter_keypoints(
+def filter_keypoints_butter(
     keypoints: np.ndarray,
     sampling_rate: float,
     cutoff: float,
@@ -1006,14 +1012,62 @@ def filter_keypoints(
     keypoints_filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
 
     for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
-        coordinate = keypoints[kpt, dim]
+        coordinate = keypoints[:, kpt, dim]
         for start, end in get_segment_borders(~np.isnan(coordinate)):
             if end - start >= min_length:
-                keypoints_filtered[kpt, dim, start:end] = sosfiltfilt(sos, coordinate[start:end])
+                keypoints_filtered[start:end, kpt, dim] = sosfiltfilt(sos, coordinate[start:end])
             else:
-                keypoints_filtered[kpt, dim, start:end] = np.nan  # too short to filter reliably
-
+                keypoints_filtered[start:end, kpt, dim] = np.nan  # too short for filtering
     return keypoints_filtered
+
+
+import numpy as np
+from scipy.signal import savgol_filter
+
+
+def filter_keypoints_savgol(
+    keypoints: np.ndarray,
+    sampling_rate: float,
+    window: float,
+    polyorder: int,
+    gap_size: float,
+) -> np.ndarray:
+    """
+    Fills short gaps, then applies a Savitzky-Golay filter to each contiguous
+    run of valid samples. Remaining NaNs (long gaps) are kept.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, n_dims)
+        sampling_rate: sampling rate in Hz
+        window: filter window length in seconds (rounded to an odd number of frames)
+        polyorder: order of the local polynomial (must be < window in frames)
+        gap_size: maximum gap (seconds) to interpolate
+    """
+    window_frames = int(round(window * sampling_rate))
+    if window_frames % 2 == 0:
+        window_frames += 1  # savgol needs an odd window
+    if window_frames <= polyorder:
+        raise ValueError(f"window ({window_frames} frames) must exceed polyorder ({polyorder})")
+
+    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
+
+    # Fast path: no NaNs, filter everything at once
+    if not np.isnan(keypoints).any():
+        if keypoints.shape[0] < window_frames:
+            raise ValueError("signal shorter than the filter window")
+        return savgol_filter(keypoints, window_frames, polyorder, axis=0)
+
+    filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
+    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
+        coordinate = keypoints[:, kpt, dim]
+        for start, end in get_segment_borders(~np.isnan(coordinate)):
+            if end - start >= window_frames:
+                filtered[start:end, kpt, dim] = savgol_filter(
+                    coordinate[start:end], window_frames, polyorder
+                )
+            else:
+                filtered[start:end, kpt, dim] = np.nan  # too short for the window
+    return filtered
 
 
 def load_keypoints_and_labels(filename: str) -> tuple[np.ndarray, list]:
