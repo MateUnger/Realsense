@@ -1022,6 +1022,66 @@ def filter_keypoints_butter(
 
 
 import numpy as np
+from scipy.ndimage import median_filter
+from scipy.signal import butter, sosfiltfilt
+
+
+def filter_keypoints_median_butter(
+    keypoints: np.ndarray,
+    sampling_rate: float,
+    cutoff: float,
+    order: int,
+    gap_size: float,
+    median_window: float | None = None,
+) -> np.ndarray:
+    """
+    Fills short gaps, optionally applies a median filter, then applies a
+    zero-phase Butterworth filter to each contiguous run of valid samples.
+    Remaining NaNs (long gaps) are kept.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, n_dims)
+        sampling_rate: sampling rate in Hz
+        cutoff: cutoff frequency in Hz
+        order: Butterworth order (effective order is doubled by filtfilt)
+        gap_size: maximum gap (seconds) to interpolate
+        median_window: median filter window in seconds, applied before the
+            Butterworth filter to remove spikes. None disables it.
+    """
+
+    if cutoff >= sampling_rate / 2:
+        raise ValueError("cutoff must be below the Nyquist frequency")
+
+    sos = butter(order, cutoff, btype="lowpass", fs=sampling_rate, output="sos")
+    min_length = 3 * (2 * sos.shape[0] + 1) + 1  # safe lower bound for sosfiltfilt padding
+
+    kernel_size = None
+    if median_window is not None:
+        if median_window <= 0:
+            raise ValueError("median_window must be positive")
+        kernel_size = max(3, int(round(median_window * sampling_rate)))
+        if kernel_size % 2 == 0:
+            kernel_size += 1  # median filter needs an odd kernel
+        min_length = max(min_length, kernel_size)
+
+    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
+    keypoints_filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
+
+    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
+        coordinate = keypoints[:, kpt, dim]
+        for start, end in get_segment_borders(~np.isnan(coordinate)):
+            if end - start >= min_length:
+                segment = coordinate[start:end]
+                if kernel_size is not None:
+                    # mode="reflect" avoids the zero-padding bias of scipy.signal.medfilt
+                    segment = median_filter(segment, size=kernel_size, mode="reflect")
+                keypoints_filtered[start:end, kpt, dim] = sosfiltfilt(sos, segment)
+            else:
+                keypoints_filtered[start:end, kpt, dim] = np.nan  # too short for filtering
+    return keypoints_filtered
+
+
+import numpy as np
 from scipy.signal import savgol_filter
 
 
@@ -1090,3 +1150,22 @@ def load_keypoints_and_labels(filename: str) -> tuple[np.ndarray, list]:
     else:
         raise FileNotFoundError(f"File: {filename} does not exist!")
     return keypoints, labels
+
+
+def get_velocity_and_acceleration(keypoint: np.ndarray, fps: float):
+    delta_t = 1 / fps  # frames/sec
+    position = keypoint  # point, meters
+    velocity = np.gradient(position, delta_t, axis=0)  # vector, m/s
+    velocity_magnitude = np.linalg.norm(velocity, axis=1)  # scalar
+    acceleration_magnitude = np.gradient(velocity_magnitude, delta_t, axis=0)  # scalar, m/s^2
+
+    return velocity_magnitude, acceleration_magnitude
+
+
+def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
+    delta_t = 1 / fps
+    position = keypoint
+    velocity = np.gradient(position, delta_t, axis=0)  # scalar
+    acceleration = np.gradient(velocity, delta_t, axis=0)  # scalar
+
+    return velocity, acceleration
