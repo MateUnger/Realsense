@@ -13,7 +13,7 @@ import math
 from scipy.interpolate import CubicSpline
 import copy
 from OneEuroFilter import OneEuroFilter
-from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt, filtfilt
+from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt, filtfilt, resample
 from scipy.ndimage import maximum_filter1d
 from scipy.interpolate import CubicSpline, PchipInterpolator
 
@@ -25,36 +25,6 @@ resolution_presets = {
     "640x360@90": {"width": 640, "height": 360, "fps": 90},
     "480x270@90": {"width": 480, "height": 270, "fps": 90},
 }
-
-stereo_labels = [
-    "nose",
-    "left_eye",
-    "right_eye",
-    "left_ear",
-    "right_ear",
-    "left_shoulder",
-    "right_shoulder",
-    "left_elbow",
-    "right_elbow",
-    "left_wrist",
-    "right_wrist",
-    "left_hip",
-    "right_hip",
-    "left_knee",
-    "right_knee",
-    "left_ankle",
-    "right_ankle",
-    "top_head",
-    "neck",
-    "mid_hip",
-    "left_big_toe",
-    "right_big_toe",
-    "left_small_toe",
-    "right_small_toe",
-    "left_heel",
-    "right_heel",
-    "mid_shoulder",
-]
 
 
 def create_ffmpeg_command(
@@ -165,7 +135,7 @@ def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -
 
 
 # =========================================== POSE ESTIMATION ===========================================
-labels = [
+labels_26 = [
     "nose",
     "left_eye",
     "right_eye",
@@ -185,7 +155,7 @@ labels = [
     "right_ankle",
     "top_head",
     "neck",
-    "mid_hip",
+    "center_hip",
     "left_big_toe",
     "right_big_toe",
     "left_small_toe",
@@ -193,6 +163,29 @@ labels = [
     "left_heel",
     "right_heel",
     "mid_shoulder",
+    "mid_hip",
+]
+
+labels_17 = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "mid_shoulder",
+    "mid_hip",
 ]
 
 
@@ -1081,10 +1074,6 @@ def filter_keypoints_median_butter(
     return keypoints_filtered
 
 
-import numpy as np
-from scipy.signal import savgol_filter
-
-
 def filter_keypoints_savgol(
     keypoints: np.ndarray,
     sampling_rate: float,
@@ -1169,3 +1158,43 @@ def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
     acceleration = np.gradient(velocity, delta_t, axis=0)  # scalar
 
     return velocity, acceleration
+
+
+from fractions import Fraction
+
+import numpy as np
+from scipy.signal import resample_poly
+
+
+def resample_timeseriess(keypoints_3d: np.ndarray, original_fps: float, target_fps: float):
+    """
+    Resample a time series to the desired frequency with polyphase filtering.
+
+    Samples keep their position in time: output sample i is at time i / target_fps, and the
+    recording starts at t = 0 in both the input and the output. Fast peaks are preserved,
+    because no extra smoothing is applied beyond the anti-aliasing filter inside the
+    resampler (which only removes content above the original Nyquist frequency).
+
+    Args:
+        keypoints_3d: array of shape (n_frames, ...) with time on axis 0 (e.g. (T, K, 3)).
+            Must not contain NaN: filling or rejecting missing frames comes first.
+        original_fps: original sampling frequency in Hz.
+        target_fps: desired sampling frequency in Hz.
+
+    Returns:
+        Array with the same shape except for axis 0, which has
+        ceil(n_frames * target_fps / original_fps) samples.
+    """
+    keypoints_3d = np.asarray(keypoints_3d, dtype=float)
+    if np.isnan(keypoints_3d).any():
+        raise ValueError("NaNs found: fill or interpolate missing frames before resampling.")
+
+    # ratio = Fraction(target_fps).limit_denominator(1000) / Fraction(original_fps).limit_denominator(
+    #     1000
+    # )
+    ratio = Fraction(target_fps / original_fps)
+    up, down = ratio.numerator, ratio.denominator  # 100 / 60 -> 5 / 3
+
+    # 'edge' repeats the first/last sample at the ends, so signals with a non-zero offset
+    # (positions in meters) don't bend towards zero at the start and end.
+    return resample_poly(keypoints_3d, up, down, axis=0, padtype="edge")
