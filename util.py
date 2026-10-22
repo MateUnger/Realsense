@@ -1,11 +1,11 @@
-import cv2
-import json
-import numpy as np
+import os
 import time
+import json
+import cv2
+import numpy as np
 import importlib
 from typing import Literal
 import pyrealsense2 as rs
-import os
 import matplotlib.pyplot as plt
 import pandas as pd
 import csv
@@ -13,11 +13,14 @@ import math
 from scipy.interpolate import CubicSpline
 import copy
 from OneEuroFilter import OneEuroFilter
-from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt, filtfilt, resample
-from scipy.ndimage import maximum_filter1d
-from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt, filtfilt, resample_poly
+from scipy.ndimage import median_filter
+from fractions import Fraction
 
 rtmlib_module = importlib.import_module("rtmlib")
+
+
+# =========================================== RECORD, ALIGN ===========================================
 
 # resolution-fps pairs that work with both color and depth
 resolution_presets = {
@@ -111,29 +114,6 @@ def create_intrinsics_object(intrinsics_dict: dict) -> rs.intrinsics:
     return intrinsics_object
 
 
-def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -> float:
-    """
-    Samples the depth map using the median value of a patch (size radius+2).
-
-    Args:
-        depth_map: array of depth values in landscape orientation
-        x,y: center coords of sampling patch
-        radius: size of patch
-    Returns:
-        depth: median depth value of sampled patch (np.nan if no valid values)
-    """
-    h, w = depth_map.shape
-    x_min, x_max = max(0, x - radius), min(w, x + radius + 1)
-    y_min, y_max = max(0, y - radius), min(h, y + radius + 1)
-
-    ROI = depth_map[y_min:y_max, x_min:x_max]
-    valid_ROI = ROI[ROI > 0]
-
-    depth = float(np.nanmedian(valid_ROI)) if valid_ROI.size > 0 else np.nan
-
-    return depth
-
-
 # =========================================== POSE ESTIMATION ===========================================
 labels_26 = [
     "nose",
@@ -165,6 +145,7 @@ labels_26 = [
     "mid_shoulder",
     "mid_hip",
 ]
+
 
 labels_17 = [
     "nose",
@@ -374,6 +355,183 @@ models = {
     },
 }
 
+# =========================================== 3D COORDINATES ===========================================
+
+
+def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -> float:
+    """
+    Samples the depth map using the median value of a patch (size radius+2).
+
+    Args:
+        depth_map: array of depth values in landscape orientation
+        x,y: center coords of sampling patch
+        radius: size of patch
+    Returns:
+        depth: median depth value of sampled patch (np.nan if no valid values)
+    """
+    h, w = depth_map.shape
+    x_min, x_max = max(0, x - radius), min(w, x + radius + 1)
+    y_min, y_max = max(0, y - radius), min(h, y + radius + 1)
+
+    ROI = depth_map[y_min:y_max, x_min:x_max]
+    valid_ROI = ROI[ROI > 0]
+
+    depth = float(np.nanmedian(valid_ROI)) if valid_ROI.size > 0 else np.nan
+
+    return depth
+
+
+def interpolate_gaps(keypoints: np.ndarray, fps: float, max_gap: float) -> np.ndarray:
+    """
+    Fill interior NaN gaps of at most `max_gap` seconds, independently per
+    keypoint and dimension. Leading/trailing gaps are left untouched.
+
+    Args:
+        keypoints: shape (n_frames, n_keypoints, n_dims).
+        fps: sampling rate in Hz
+        max_gap: maximum gap length in seconds
+    """
+    if keypoints.ndim != 3:
+        raise ValueError(f"Expected 3D array, got shape {keypoints.shape}")
+
+    n_frames, n_keypoints, n_dims = keypoints.shape
+    max_gap_frames = int(round(max_gap * fps))
+    keypoints_filled = keypoints.astype(float, copy=True)
+
+    for kpt_idx in range(n_keypoints):
+        for dim_idx in range(n_dims):
+            coordinate = keypoints[:, kpt_idx, dim_idx]
+            is_nan = np.isnan(coordinate)
+            valid = np.flatnonzero(~is_nan)
+            if valid.size < 2 or valid.size == n_frames:
+                continue
+
+            # Run-length encode NaN runs: starts inclusive, ends exclusive
+            padded = np.concatenate(([False], is_nan, [False])).astype(np.int8)
+            edges = np.flatnonzero(np.diff(padded))
+            starts, ends = edges[::2], edges[1::2]
+
+            spline = None
+            for start, end in zip(starts, ends):
+                if start == 0 or end == n_frames:  # edge gap: no anchor on one side
+                    continue
+                if end - start > max_gap_frames:  # too long
+                    continue
+                if spline is None:  # fit once per signal
+                    spline = CubicSpline(valid, coordinate[valid], extrapolate=False)
+                keypoints_filled[start:end, kpt_idx, dim_idx] = spline(np.arange(start, end))
+
+    return keypoints_filled
+
+
+def get_segment_borders(valid: np.ndarray):
+    """
+    Return starts, ends of contiguous valid (True) segments (end exclusive).
+    """
+    diff = np.diff(np.concatenate(([0], valid.astype(np.int8), [0])))
+    return zip(np.flatnonzero(diff == 1), np.flatnonzero(diff == -1))
+
+
+def filter_keypoints_median_butter(
+    keypoints: np.ndarray,
+    sampling_rate: float,
+    cutoff: float,
+    order: int,
+    gap_size: float,
+    median_window: float | None = None,
+) -> np.ndarray:
+    """
+    Fills short gaps, optionally applies a median filter, then applies a
+    zero-phase Butterworth filter to each contiguous segment of valid samples.
+    Remaining NaNs (long gaps) are kept.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, n_dims)
+        sampling_rate: sampling rate in Hz
+        cutoff: cutoff frequency in Hz
+        order: Butterworth order (effective order is doubled by filtfilt)
+        gap_size: maximum gap (seconds) to interpolate
+        median_window: median filter window in seconds, applied before the
+            Butterworth filter to remove spikes. None disables it.
+    """
+
+    if cutoff >= sampling_rate / 2:
+        raise ValueError("cutoff must be below the Nyquist frequency")
+
+    sos = butter(order, cutoff, btype="lowpass", fs=sampling_rate, output="sos")
+    min_length = 3 * (2 * sos.shape[0] + 1) + 1  # safe lower bound for sosfiltfilt padding
+
+    kernel_size = None
+    if median_window is not None:
+        if median_window <= 0:
+            raise ValueError("median_window must be positive")
+        kernel_size = max(3, int(round(median_window * sampling_rate)))
+        if kernel_size % 2 == 0:
+            kernel_size += 1  # median filter needs an odd kernel
+        min_length = max(min_length, kernel_size)
+
+    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
+    keypoints_filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
+
+    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
+        coordinate = keypoints[:, kpt, dim]
+        for start, end in get_segment_borders(~np.isnan(coordinate)):
+            if end - start >= min_length:
+                segment = coordinate[start:end]
+                if kernel_size is not None:
+                    # mode="reflect" avoids the zero-padding bias of scipy.signal.medfilt
+                    segment = median_filter(segment, size=kernel_size, mode="reflect")
+                keypoints_filtered[start:end, kpt, dim] = sosfiltfilt(sos, segment)
+            else:
+                keypoints_filtered[start:end, kpt, dim] = np.nan  # too short for filtering
+    return keypoints_filtered
+
+
+def subtract_mean(keypoints: np.ndarray) -> tuple:
+    """Subtract the mean (over time) from every keypoint for each dimention.
+    Args:
+        keypoints: array shaped (frames, keypoints, dims)
+    Returns:
+        centered: keypoints centered around their mean over time
+        mean: (1, keypoints, dims) used for centering"""
+    mean = np.nanmean(keypoints, axis=0, keepdims=True)
+    centered_keypoints = keypoints - mean
+    return centered_keypoints, mean
+
+
+def resample_keypoints(keypoints: np.ndarray, original_fps: float, target_fps: float):
+    """Resample keypoint data to desired sampling frequency.
+    Note, the DC offset removed first/centered (to avoid filter leaks), then added back.
+    Args:
+        keypoints: array (frames, keypoints, dims)
+        original_fps: sampling frequency of the input
+        target_fps: desired sampling frequency
+    Returns:
+        resampled: keypoints resampled to target_fps (with mean added back)."""
+    ratio = Fraction(str(target_fps)) / Fraction(str(original_fps))
+    centered, mean = subtract_mean(keypoints)
+    resampled = resample_poly(centered, ratio.numerator, ratio.denominator, axis=0, padtype="edge")
+    return resampled + mean
+
+
+def get_velocity_and_acceleration(keypoint: np.ndarray, fps: float):
+    delta_t = 1 / fps  # frames/sec
+    position = keypoint  # point, meters
+    velocity = np.gradient(position, delta_t, axis=0)  # vector, m/s
+    velocity_magnitude = np.linalg.norm(velocity, axis=1)  # scalar
+    acceleration_magnitude = np.gradient(velocity_magnitude, delta_t, axis=0)  # scalar, m/s^2
+
+    return velocity_magnitude, acceleration_magnitude
+
+
+def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
+    delta_t = 1 / fps
+    position = keypoint
+    velocity = np.gradient(position, delta_t, axis=0)  # scalar
+    acceleration = np.gradient(velocity, delta_t, axis=0)  # scalar
+
+    return velocity, acceleration
+
 
 # =========================================== CALIBRATION ===========================================
 
@@ -517,271 +675,7 @@ def get_extrinsics(calibration_img_path: str, debug_fig_path: str = None):
     return R, t_vec, rvec
 
 
-def filter_keypoints_euro(keypoints: np.ndarray, fps: float):
-    n_frames, n_keypoints, n_dims = keypoints.shape
-
-    # One filter for each keypoint and each XYZ coordinate
-    filters = [
-        [OneEuroFilter(freq=fps, mincutoff=1, beta=0.1, dcutoff=1.0) for _ in range(n_dims)]
-        for _ in range(n_keypoints)
-    ]
-
-    filtered = np.empty_like(keypoints, dtype=float)
-
-    for frame_idx in range(n_frames):
-        timestamp = frame_idx / fps
-
-        for kpt_idx in range(n_keypoints):
-            for xyz in range(n_dims):
-                filtered[frame_idx, kpt_idx, xyz] = filters[kpt_idx][xyz].filter(
-                    keypoints[frame_idx, kpt_idx, xyz], timestamp
-                )
-
-    return filtered
-
-
-def lowpass_keypoints(
-    keypoints: np.ndarray, fps: float, cutoff: float, order: int = 4
-) -> np.ndarray:
-    """
-    Butterworth low-pass along time axis with zero-phase shift (forward and backward pass).
-    Only meant to be used with 2D keypoints as they contain no nans or gaps.
-
-    Args:
-        keypoints: (n_frames, n_keypoints, n_dims)
-        fps: sampling rate in Hz
-        cutoff: cutoff in Hz (-6 dB point after forward-backward filtering)
-        order: per-pass filter order (effective order is doubled)
-    """
-    if not 0 < cutoff < fps / 2:
-        raise ValueError(f"cutoff must be in (0, {fps / 2}) Hz, got {cutoff}")
-
-    sos = butter(order, cutoff, btype="low", fs=fps, output="sos")
-    return sosfiltfilt(sos, keypoints, axis=0)
-
-
-def filter_2d_keypoints(
-    keypoints_2d: np.ndarray,
-    fps: float,
-    plot_kpt_idx: int | None = None,
-):
-    keypoints_2d_filtered = filter_keypoints_euro(
-        keypoints=keypoints_2d,
-        fps=fps,
-    ).copy()
-
-    n_keypoints = keypoints_2d_filtered.shape[1]
-
-    # Store plotting data for the requested keypoint
-    plot_data = None
-
-    for kpt_idx in range(n_keypoints):
-        og = keypoints_2d_filtered[:, kpt_idx, :].copy()
-        kpt_coords = og.copy()
-
-        movement = np.linalg.norm(
-            np.diff(
-                kpt_coords,
-                axis=0,
-                prepend=np.expand_dims(kpt_coords[0, :], axis=0),
-            ),
-            axis=1,
-        )
-
-        std = np.std(movement)
-
-        # Find peaks to remove jerky outliers
-        min_peak_height = std * 2
-        min_peak_distance = int(fps * 0.05)
-        prominance = 2 * std
-
-        peaks, _ = find_peaks(
-            movement,
-            height=min_peak_height,
-            distance=min_peak_distance,
-            prominence=prominance,
-        )
-
-        _, width_heights, left_ips, right_ips = peak_widths(
-            x=movement,
-            peaks=peaks,
-            rel_height=0.95,
-        )
-
-        frames = np.arange(len(kpt_coords))
-
-        # Remove all detected spike regions
-        for left, right in zip(left_ips, right_ips):
-            start = math.floor(left)
-            end = math.ceil(right)
-
-            kpt_coords[start : end + 1, :] = np.nan
-
-        # Find short valid segments between NaN regions
-        not_nan = ~np.isnan(kpt_coords[:, 0])
-
-        diff = np.diff(not_nan.astype(int))
-
-        starts = np.where(diff == 1)[0] + 1
-        ends = np.where(diff == -1)[0] + 1
-
-        if not_nan[0]:
-            starts = np.r_[0, starts]
-
-        if not_nan[-1]:
-            ends = np.r_[ends, len(not_nan)]
-
-        # Remove short valid segments
-        for start, end in zip(starts, ends):
-            surrounded_by_nan = (
-                start > 0 and end < len(not_nan) and not not_nan[start - 1] and not not_nan[end]
-            )
-
-            if surrounded_by_nan and end - start < fps * 0.25:
-                kpt_coords[start:end, :] = np.nan
-
-        # Cubic spline interpolation
-        for dim in range(2):
-            coordinate = kpt_coords[:, dim]
-            not_nan = ~np.isnan(coordinate)
-
-            if np.sum(not_nan) < 4:
-                continue
-
-            spline = CubicSpline(
-                frames[not_nan],
-                coordinate[not_nan],
-            )
-
-            coordinate[~not_nan] = spline(frames[~not_nan])
-
-            keypoints_2d_filtered[:, kpt_idx, dim] = coordinate
-
-        # Save plotting data for selected keypoint
-        if kpt_idx == plot_kpt_idx:
-            plot_data = {
-                "og": og,
-                "movement": movement,
-                "peaks": peaks,
-                "min_peak_height": min_peak_height,
-                "left_ips": left_ips,
-                "right_ips": right_ips,
-                "width_heights": width_heights,
-            }
-
-    # Low-pass filter all keypoints
-    keypoints_2d_filtered = lowpass_keypoints(
-        keypoints_2d_filtered,
-        fps,
-        2,
-        4,
-    )
-
-    # Plot selected keypoint
-    if plot_kpt_idx is not None and plot_data is not None:
-        fig, axs = plt.subplots(3, 1, figsize=(15, 7))
-
-        axs[0].set_title(f"Keypoint {plot_kpt_idx}")
-        axs[0].plot(plot_data["og"])
-
-        axs[1].set_title("movement")
-        axs[1].plot(plot_data["movement"])
-        axs[1].plot(
-            plot_data["peaks"],
-            plot_data["movement"][plot_data["peaks"]],
-            "r*",
-            markersize=4,
-        )
-        axs[1].hlines(
-            plot_data["min_peak_height"],
-            0,
-            plot_data["movement"].shape[0],
-        )
-        axs[1].plot(
-            plot_data["left_ips"],
-            plot_data["width_heights"],
-            "o",
-            label="turn start",
-            markersize=4,
-        )
-        axs[1].plot(
-            plot_data["right_ips"],
-            plot_data["width_heights"],
-            "o",
-            label="turn end",
-            markersize=4,
-        )
-        axs[1].set_ylim([-5, 50])
-
-        axs[2].plot(keypoints_2d_filtered[:, plot_kpt_idx, :])
-        axs[2].set_title(f"Keypoint {plot_kpt_idx} filtered")
-
-        for ax in axs[:-2]:
-            ax.set_xticks([])
-            ax.grid()
-
-        plt.tight_layout()
-        plt.show()
-
-    return keypoints_2d_filtered
-
-
-def interpolate_gaps(keypoints: np.ndarray, fps: float, max_gap: float) -> np.ndarray:
-    """
-    Fill interior NaN gaps of at most `max_gap` seconds, independently per
-    keypoint and dimension. Leading/trailing gaps are left untouched.
-
-    Args:
-        keypoints: shape (n_frames, n_keypoints, n_dims).
-        fps: sampling rate in Hz
-        max_gap: maximum gap length in seconds
-    """
-    if keypoints.ndim != 3:
-        raise ValueError(f"Expected 3D array, got shape {keypoints.shape}")
-
-    n_frames, n_keypoints, n_dims = keypoints.shape
-    max_gap_frames = int(round(max_gap * fps))
-    keypoints_filled = keypoints.astype(float, copy=True)
-
-    for kpt_idx in range(n_keypoints):
-        for dim_idx in range(n_dims):
-            coordinate = keypoints[:, kpt_idx, dim_idx]
-            is_nan = np.isnan(coordinate)
-            valid = np.flatnonzero(~is_nan)
-            if valid.size < 2 or valid.size == n_frames:
-                continue
-
-            # Run-length encode NaN runs: starts inclusive, ends exclusive
-            padded = np.concatenate(([False], is_nan, [False])).astype(np.int8)
-            edges = np.flatnonzero(np.diff(padded))
-            starts, ends = edges[::2], edges[1::2]
-
-            spline = None
-            for start, end in zip(starts, ends):
-                if start == 0 or end == n_frames:  # edge gap: no anchor on one side
-                    continue
-                if end - start > max_gap_frames:  # too long
-                    continue
-                if spline is None:  # fit once per signal
-                    spline = CubicSpline(valid, coordinate[valid], extrapolate=False)
-                keypoints_filled[start:end, kpt_idx, dim_idx] = spline(np.arange(start, end))
-
-    return keypoints_filled
-
-
-def get_basename(full_file_path: str) -> str:
-    """
-    Return the basename of input file path e.g.: ...folder1/folder2/image_name.png -> image_name
-
-    Args:
-        full_file_path: input file path string
-
-    Returns:
-        basename: basename of the input (without folders or extension)
-    """
-    basename_without_ext = os.path.splitext(full_file_path)[0]
-    basename = os.path.basename(basename_without_ext)
-    return basename
+# =========================================== QUALISYS ===========================================
 
 
 def get_qualisys_metadata(filename: str) -> dict:
@@ -818,10 +712,7 @@ def get_qualisys_metadata(filename: str) -> dict:
     return qualisys_metadata
 
 
-def format_qualisys_export(
-    input_filename: str, output_filename: str = None
-) -> tuple[np.ndarray, list]:
-    # TODO: add logging, maybe return value
+def get_qualisys_keypoints(filename: str) -> tuple[np.ndarray, list]:
     """
     Read qualisys export file in .tsv format, format contents to fit multidimensional np.array,
     delete gap-filled entries and convert measurements from milimeter to meter.
@@ -831,25 +722,16 @@ def format_qualisys_export(
         output_filename: optional, path to save the result as a .npz file. Default is the input_filename directory.
 
     Returns:
-        keypoints: np.array of keypoint data
+        keypoints: np.array of keypoint data (frames, markers, dims)
         labels: keypoint labels as list
     """
-    if not os.path.exists(input_filename):
-        raise FileNotFoundError(f"File {input_filename} does not exits")
-
-    elif output_filename == None:
-        basename = get_basename(input_filename)
-        directory = os.path.dirname(input_filename)
-        output_filename = os.path.join(directory, f"qualisys.npz")
-
     # read first 10 rows to get number of markers, frames, marker names...
-    metadata = get_qualisys_metadata(input_filename)
+    metadata = get_qualisys_metadata(filename)
     labels = metadata["marker_names"]
 
     # Read the TSV file, skipping the first 10 rows (only metadata)
-    df = pd.read_csv(input_filename, sep="\t", header=None, skiprows=11, dtype=None)
+    df = pd.read_csv(filename, sep="\t", header=None, skiprows=11, dtype=None)
 
-    # TODO: find out why is is there at all
     # drop last column since it is empty
     df = df.drop(df.columns[[-1]], axis=1)
 
@@ -875,7 +757,7 @@ def format_qualisys_export(
             # leave type as str ('Measured' or 'Gap-filled')
             elif dim_idx == 3:
                 pass
-    # remove dim 3 (type of measurement)
+    # remove type of measurement
     keypoints = keypoints[:, :3, :].astype(float)
 
     # convert from milimeters to meters
@@ -885,11 +767,6 @@ def format_qualisys_export(
     left_hip_front = keypoints[labels.index("left_hip"), :, :]
     right_hip_front = keypoints[labels.index("right_hip"), :, :]
     mid_hip_front = np.mean((left_hip_front, right_hip_front), axis=0)
-
-    # calculate mid_hip_back keypoint
-    # left_hip_back = keypoints[labels.index("left_hip_back"), :, :]
-    # right_hip_back = keypoints[labels.index("right_hip_back"), :, :]
-    # mid_hip_back = np.mean((left_hip_back, right_hip_back), axis=0)
 
     # calculate mid_shoulder front keypoint
     left_shoulder = keypoints[labels.index("left_shoulder"), :]
@@ -903,220 +780,9 @@ def format_qualisys_export(
 
     keypoints = keypoints.transpose(2, 0, 1)
     labels.append("mid_shoulder")
-    # labels.append("mid_hip_back")
     labels.append("mid_hip")
 
-    # np.savez(output_filename, keypoints=keypoints, labels=labels)
     return keypoints, labels
-
-
-def filter_data(
-    data: np.ndarray,
-    sampling_rate: float,
-    filter_type: Literal["lowpass", "bandpass"],
-    cutoff: list,
-    order: int,
-    gap_size: int,
-) -> np.ndarray:
-    """
-    Interpolates and applies filter to data (with NaNs).
-
-    Args:
-        data (np.ndarray):      Input data with shape (n_kpt, n_dims, n_frames).
-        sampling_rate (float):  Sampling rate of the data.
-        cutoff (float):         Cutoff frequency for the low-pass filter.
-        order (int):            Order of the Butterworth filter.
-        gap_size (int):         Maximum size (in seconds) of gaps to fill
-
-    Returns:
-        filtered_data (np.ndarray): Interpolated and filtered data with the origianl Nan values in place.
-
-    """
-    n_kpt, n_dims, n_frames = data.shape
-    data = interpolate_gaps(data, sampling_rate, gap_size)  # Fill short gaps
-    filtered_data = copy.deepcopy(data)
-
-    match filter_type:
-        case "lowpass":
-            cutoff = cutoff[0]
-        case "bandpass":
-            cutoff = np.asarray(cutoff)
-    # Design Butterworth low-pass filter
-    b, a = butter(N=order, Wn=cutoff, btype=filter_type, analog=False, fs=sampling_rate)
-
-    for kpt in range(n_kpt):
-        for dim in range(n_dims):
-            trajectory = data[kpt, dim, :]
-
-            # search for NaNs
-            nans = np.isnan(trajectory)
-
-            # if there are nans, interpolate the missing values for subsequent filtering
-            if np.any(nans):
-                valid_indices = ~nans
-                trajectory[nans] = np.interp(
-                    np.flatnonzero(nans),
-                    np.flatnonzero(valid_indices),
-                    trajectory[valid_indices],
-                )
-
-            trajectory = filtfilt(b, a, trajectory)  # Apply filter
-            trajectory[nans] = np.nan  # Restore NaNs
-
-            filtered_data[kpt, dim, :] = trajectory
-
-    return filtered_data
-
-
-def get_segment_borders(valid: np.ndarray):
-    """
-    Return starts, ends of contiguous valid (True) segments (end exclusive).
-    """
-    diff = np.diff(np.concatenate(([0], valid.astype(np.int8), [0])))
-    return zip(np.flatnonzero(diff == 1), np.flatnonzero(diff == -1))
-
-
-def filter_keypoints_butter(
-    keypoints: np.ndarray,
-    sampling_rate: float,
-    cutoff: float,
-    order: int,
-    gap_size: float,
-) -> np.ndarray:
-    """
-    Fills short gaps, then applies a zero-phase Butterworth filter to each
-    contiguous run of valid samples. Remaining NaNs (long gaps) are kept.
-
-    Args:
-        keypoints: shape (n_frames, n_kpt, n_dims)
-        sampling_rate: sampling rate in Hz
-        cutoff: cutoff frequency in Hz
-        order: Butterworth order (effective order is doubled by filtfilt)
-        gap_size: maximum gap (seconds) to interpolate
-    """
-
-    if cutoff >= sampling_rate / 2:
-        raise ValueError("cutoff must be below the Nyquist frequency")
-
-    sos = butter(order, cutoff, btype="lowpass", fs=sampling_rate, output="sos")
-    min_length = 3 * (2 * sos.shape[0] + 1) + 1  # safe lower bound for sosfiltfilt padding
-
-    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
-    keypoints_filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
-
-    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
-        coordinate = keypoints[:, kpt, dim]
-        for start, end in get_segment_borders(~np.isnan(coordinate)):
-            if end - start >= min_length:
-                keypoints_filtered[start:end, kpt, dim] = sosfiltfilt(sos, coordinate[start:end])
-            else:
-                keypoints_filtered[start:end, kpt, dim] = np.nan  # too short for filtering
-    return keypoints_filtered
-
-
-import numpy as np
-from scipy.ndimage import median_filter
-from scipy.signal import butter, sosfiltfilt
-
-
-def filter_keypoints_median_butter(
-    keypoints: np.ndarray,
-    sampling_rate: float,
-    cutoff: float,
-    order: int,
-    gap_size: float,
-    median_window: float | None = None,
-) -> np.ndarray:
-    """
-    Fills short gaps, optionally applies a median filter, then applies a
-    zero-phase Butterworth filter to each contiguous run of valid samples.
-    Remaining NaNs (long gaps) are kept.
-
-    Args:
-        keypoints: shape (n_frames, n_kpt, n_dims)
-        sampling_rate: sampling rate in Hz
-        cutoff: cutoff frequency in Hz
-        order: Butterworth order (effective order is doubled by filtfilt)
-        gap_size: maximum gap (seconds) to interpolate
-        median_window: median filter window in seconds, applied before the
-            Butterworth filter to remove spikes. None disables it.
-    """
-
-    if cutoff >= sampling_rate / 2:
-        raise ValueError("cutoff must be below the Nyquist frequency")
-
-    sos = butter(order, cutoff, btype="lowpass", fs=sampling_rate, output="sos")
-    min_length = 3 * (2 * sos.shape[0] + 1) + 1  # safe lower bound for sosfiltfilt padding
-
-    kernel_size = None
-    if median_window is not None:
-        if median_window <= 0:
-            raise ValueError("median_window must be positive")
-        kernel_size = max(3, int(round(median_window * sampling_rate)))
-        if kernel_size % 2 == 0:
-            kernel_size += 1  # median filter needs an odd kernel
-        min_length = max(min_length, kernel_size)
-
-    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
-    keypoints_filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
-
-    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
-        coordinate = keypoints[:, kpt, dim]
-        for start, end in get_segment_borders(~np.isnan(coordinate)):
-            if end - start >= min_length:
-                segment = coordinate[start:end]
-                if kernel_size is not None:
-                    # mode="reflect" avoids the zero-padding bias of scipy.signal.medfilt
-                    segment = median_filter(segment, size=kernel_size, mode="reflect")
-                keypoints_filtered[start:end, kpt, dim] = sosfiltfilt(sos, segment)
-            else:
-                keypoints_filtered[start:end, kpt, dim] = np.nan  # too short for filtering
-    return keypoints_filtered
-
-
-def filter_keypoints_savgol(
-    keypoints: np.ndarray,
-    sampling_rate: float,
-    window: float,
-    polyorder: int,
-    gap_size: float,
-) -> np.ndarray:
-    """
-    Fills short gaps, then applies a Savitzky-Golay filter to each contiguous
-    run of valid samples. Remaining NaNs (long gaps) are kept.
-
-    Args:
-        keypoints: shape (n_frames, n_kpt, n_dims)
-        sampling_rate: sampling rate in Hz
-        window: filter window length in seconds (rounded to an odd number of frames)
-        polyorder: order of the local polynomial (must be < window in frames)
-        gap_size: maximum gap (seconds) to interpolate
-    """
-    window_frames = int(round(window * sampling_rate))
-    if window_frames % 2 == 0:
-        window_frames += 1  # savgol needs an odd window
-    if window_frames <= polyorder:
-        raise ValueError(f"window ({window_frames} frames) must exceed polyorder ({polyorder})")
-
-    keypoints = interpolate_gaps(keypoints, sampling_rate, gap_size)
-
-    # Fast path: no NaNs, filter everything at once
-    if not np.isnan(keypoints).any():
-        if keypoints.shape[0] < window_frames:
-            raise ValueError("signal shorter than the filter window")
-        return savgol_filter(keypoints, window_frames, polyorder, axis=0)
-
-    filtered = np.array(keypoints, dtype=float, copy=True)  # never touch the input
-    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
-        coordinate = keypoints[:, kpt, dim]
-        for start, end in get_segment_borders(~np.isnan(coordinate)):
-            if end - start >= window_frames:
-                filtered[start:end, kpt, dim] = savgol_filter(
-                    coordinate[start:end], window_frames, polyorder
-                )
-            else:
-                filtered[start:end, kpt, dim] = np.nan  # too short for the window
-    return filtered
 
 
 def load_keypoints_and_labels(filename: str) -> tuple[np.ndarray, list]:
@@ -1139,62 +805,3 @@ def load_keypoints_and_labels(filename: str) -> tuple[np.ndarray, list]:
     else:
         raise FileNotFoundError(f"File: {filename} does not exist!")
     return keypoints, labels
-
-
-def get_velocity_and_acceleration(keypoint: np.ndarray, fps: float):
-    delta_t = 1 / fps  # frames/sec
-    position = keypoint  # point, meters
-    velocity = np.gradient(position, delta_t, axis=0)  # vector, m/s
-    velocity_magnitude = np.linalg.norm(velocity, axis=1)  # scalar
-    acceleration_magnitude = np.gradient(velocity_magnitude, delta_t, axis=0)  # scalar, m/s^2
-
-    return velocity_magnitude, acceleration_magnitude
-
-
-def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
-    delta_t = 1 / fps
-    position = keypoint
-    velocity = np.gradient(position, delta_t, axis=0)  # scalar
-    acceleration = np.gradient(velocity, delta_t, axis=0)  # scalar
-
-    return velocity, acceleration
-
-
-from fractions import Fraction
-
-import numpy as np
-from scipy.signal import resample_poly
-
-
-def resample_timeseriess(keypoints_3d: np.ndarray, original_fps: float, target_fps: float):
-    """
-    Resample a time series to the desired frequency with polyphase filtering.
-
-    Samples keep their position in time: output sample i is at time i / target_fps, and the
-    recording starts at t = 0 in both the input and the output. Fast peaks are preserved,
-    because no extra smoothing is applied beyond the anti-aliasing filter inside the
-    resampler (which only removes content above the original Nyquist frequency).
-
-    Args:
-        keypoints_3d: array of shape (n_frames, ...) with time on axis 0 (e.g. (T, K, 3)).
-            Must not contain NaN: filling or rejecting missing frames comes first.
-        original_fps: original sampling frequency in Hz.
-        target_fps: desired sampling frequency in Hz.
-
-    Returns:
-        Array with the same shape except for axis 0, which has
-        ceil(n_frames * target_fps / original_fps) samples.
-    """
-    keypoints_3d = np.asarray(keypoints_3d, dtype=float)
-    if np.isnan(keypoints_3d).any():
-        raise ValueError("NaNs found: fill or interpolate missing frames before resampling.")
-
-    # ratio = Fraction(target_fps).limit_denominator(1000) / Fraction(original_fps).limit_denominator(
-    #     1000
-    # )
-    ratio = Fraction(target_fps / original_fps)
-    up, down = ratio.numerator, ratio.denominator  # 100 / 60 -> 5 / 3
-
-    # 'edge' repeats the first/last sample at the ends, so signals with a non-zero offset
-    # (positions in meters) don't bend towards zero at the start and end.
-    return resample_poly(keypoints_3d, up, down, axis=0, padtype="edge")
