@@ -6,14 +6,10 @@ import numpy as np
 import importlib
 from typing import Literal
 import pyrealsense2 as rs
-import matplotlib.pyplot as plt
 import pandas as pd
 import csv
-import math
 from scipy.interpolate import CubicSpline
-import copy
-from OneEuroFilter import OneEuroFilter
-from scipy.signal import find_peaks, peak_widths, butter, sosfiltfilt, filtfilt, resample_poly
+from scipy.signal import butter, sosfiltfilt, resample_poly, find_peaks
 from scipy.ndimage import median_filter
 from fractions import Fraction
 
@@ -487,6 +483,69 @@ def filter_keypoints_median_butter(
     return keypoints_filtered
 
 
+def reject_outliers_hampel(
+    keypoints: np.ndarray,
+    sampling_rate: float,
+    window: float = 0.2,
+    n_sigma: float = 3,
+    min_deviation: float = 0.02,
+) -> np.ndarray:
+    """
+    Hampel filter: replace samples that deviate too far from the rolling median with NaN,
+    independently per keypoint and dimension. Removes single-frame depth spikes that a
+    lowpass filter would only smear out.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, n_dims)
+        sampling_rate: sampling rate in Hz
+        window: rolling window in seconds
+        n_sigma: threshold in robust standard deviations (1.4826 * MAD)
+        min_deviation: threshold never drops below this (same units as keypoints, m)
+    Returns:
+        keypoints with outliers set to NaN
+    """
+    n_frames = keypoints.shape[0]
+    window_frames = int(round(window * sampling_rate)) | 1  # odd, centered
+    df = pd.DataFrame(keypoints.reshape(n_frames, -1))
+    median = df.rolling(window_frames, center=True, min_periods=3).median()
+    mad = (df - median).abs().rolling(window_frames, center=True, min_periods=3).median() * 1.4826
+    threshold = np.maximum(n_sigma * mad.to_numpy(), min_deviation)
+
+    cleaned = keypoints.reshape(n_frames, -1).astype(float, copy=True)
+    cleaned[np.abs(cleaned - median.to_numpy()) > threshold] = np.nan
+    return cleaned.reshape(keypoints.shape)
+
+
+def filter_keypoints_stereo(
+    keypoints: np.ndarray,
+    sampling_rate: float,
+    cutoffs: tuple[float, float, float] = (3, 3, 5),
+    order: int = 4,
+    gap_size: float = 0.25,
+    hampel_window: float = 0.2,
+) -> np.ndarray:
+    """
+    Filter stereo keypoints for velocity estimates: Hampel outlier rejection, then a zero-phase
+    Butterworth with a separate cutoff per axis.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, 3), in the stereo global frame (horizontal, depth, vertical)
+        sampling_rate: actual sampling rate in Hz (from the timestamps, not the nominal fps)
+        cutoffs: cutoff frequency in Hz per axis (horizontal, depth, vertical)
+        order: Butterworth order (effective order is doubled by filtfilt)
+        gap_size: maximum gap (seconds) to interpolate, including removed outliers
+        hampel_window: Hampel window in seconds
+    """
+    keypoints = reject_outliers_hampel(keypoints, sampling_rate, window=hampel_window)
+
+    keypoints_filtered = np.empty(keypoints.shape, dtype=float)
+    for dim, cutoff in enumerate(cutoffs):
+        keypoints_filtered[:, :, [dim]] = filter_keypoints_median_butter(
+            keypoints[:, :, [dim]], sampling_rate, cutoff, order, gap_size
+        )
+    return keypoints_filtered
+
+
 def subtract_mean(keypoints: np.ndarray) -> tuple:
     """Subtract the mean (over time) from every keypoint for each dimention.
     Args:
@@ -514,6 +573,86 @@ def resample_keypoints(keypoints: np.ndarray, original_fps: float, target_fps: f
     return resampled + mean
 
 
+def get_frame_times(
+    filename: str, n_frames: int | None = None, startup: float = 2.0
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Clean the frame timestamps written during conversion (_timestamps.bin, float64 ms) and
+    estimate the actual frame rate (the camera runs at 59.755 fps in the 60 fps mode and
+    89.868 fps in the 90 fps mode; using the nominal rate drifts ~0.25 s/min against qualisys).
+
+    Drops the frames up to a startup dropout (gap > 0.1 s in the first `startup` seconds),
+    duplicated frames (same frame delivered twice) and frames whose timestamp goes backwards.
+    Each kept frame is placed on a uniform grid at the actual frame rate, which removes the
+    timestamp jitter and keeps dropped frames as gaps in the times.
+
+    Args:
+        filename: path to the _timestamps.bin file
+        n_frames: number of keypoint frames, timestamps beyond it are ignored
+        startup: time window (s) at the start in which a dropout is searched for
+    Returns:
+        frames: indices of the frames to keep, use as keypoints[frames]
+        times: time of each kept frame in seconds, starting at 0
+        fps: actual frame rate in Hz
+    """
+    timestamps = np.fromfile(filename, dtype=np.float64) / 1000
+    if n_frames is not None:
+        timestamps = timestamps[:n_frames]
+    intervals = np.diff(timestamps)
+    median_interval = np.median(intervals)
+    normal = (intervals > 0.8 * median_interval) & (intervals < 1.2 * median_interval)
+    fps = 1 / intervals[normal].mean()
+
+    # drop everything up to (and including) the last dropout in the first seconds
+    dropouts = np.flatnonzero((intervals > 0.1) & (np.arange(len(intervals)) < startup * fps))
+    first = dropouts[-1] + 1 if dropouts.size else 0
+
+    # slot of each frame on the frame grid; keep a frame only if it is later than all before it
+    slots = np.round((timestamps[first:] - timestamps[first]) * fps).astype(int)
+    keep = np.concatenate(([True], slots[1:] > np.maximum.accumulate(slots)[:-1]))
+
+    frames = first + np.flatnonzero(keep)
+    times = slots[keep] / fps
+    return frames, times, fps
+
+
+def resample_keypoints_to_rate(
+    keypoints: np.ndarray, times: np.ndarray, target_fps: float, max_gap: float = 0.25
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Resample keypoints with known frame times onto a uniform grid by cubic interpolation, per
+    keypoint and dimension. Unlike resample_keypoints this works for any rate ratio
+    (e.g. 59.755 -> 100 Hz) and accounts for dropped frames. Grid points inside NaN gaps
+    longer than max_gap stay NaN.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, n_dims)
+        times: time of each frame in seconds (e.g. from get_frame_times)
+        target_fps: sampling rate of the output in Hz
+        max_gap: longest gap (s) between valid samples that is interpolated over
+    Returns:
+        resampled: shape (n_samples, n_kpt, n_dims)
+        grid: time of each output sample in seconds
+    """
+    grid = np.arange(times[0], times[-1], 1 / target_fps)
+    resampled = np.full((len(grid),) + keypoints.shape[1:], np.nan)
+
+    for kpt, dim in np.ndindex(keypoints.shape[1], keypoints.shape[2]):
+        coordinate = keypoints[:, kpt, dim]
+        valid = ~np.isnan(coordinate)
+        if valid.sum() < 4:
+            continue
+        valid_times = times[valid]
+        values = CubicSpline(valid_times, coordinate[valid], extrapolate=False)(grid)
+
+        # blank grid points whose neighbouring valid samples are too far apart
+        pos = np.clip(np.searchsorted(valid_times, grid), 1, len(valid_times) - 1)
+        values[valid_times[pos] - valid_times[pos - 1] > max_gap] = np.nan
+        resampled[:, kpt, dim] = values
+
+    return resampled, grid
+
+
 def get_velocity_and_acceleration(keypoint: np.ndarray, fps: float):
     delta_t = 1 / fps  # frames/sec
     position = keypoint  # point, meters
@@ -531,6 +670,95 @@ def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
     acceleration = np.gradient(velocity, delta_t, axis=0)  # scalar
 
     return velocity, acceleration
+
+
+# =========================================== SEGMENTATION ===========================================
+
+
+def segment_pulls(
+    keypoint: np.ndarray,
+    fps: float,
+    min_peak_velocity: float | None = None,
+    min_interval: float = 1.5,
+    onset_fraction: float = 0.1,
+    vertical_axis: int = 2,
+    max_velocity: float = 2.0,
+    min_displacement: float = 0.1,
+) -> tuple[list, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Segment a pull test into pulls, each segment running from one pull onset to the next.
+
+    Each pull is a velocity peak along the (horizontal) pull direction followed by a return, so
+    the speed has two peaks per pull while the signed velocity along the pull direction has one.
+    The pull direction is the main axis of the horizontal velocity, signed so that it points
+    away from the rest position. The onset is the last sample before a peak where the velocity
+    is below onset_fraction of the peak velocity.
+
+    Args:
+        keypoint: position of one keypoint, shape (n_frames, 3), e.g. mid_shoulder
+        fps: sampling rate in Hz
+        min_peak_velocity: minimum pull peak velocity in m/s (default: half the 99th percentile;
+            lower it if small pulls are missed)
+        min_interval: minimum time between two pulls in seconds
+        onset_fraction: onset threshold as a fraction of the peak velocity
+        vertical_axis: index of the vertical axis (excluded from the pull direction)
+        max_velocity: samples faster than this (m/s) are tracking errors and ignored
+        min_displacement: minimum displacement (m) along the pull direction for a pull
+    Returns:
+        segments: list of (start, end) frame indices (end exclusive), the last one ends at the
+            end of the recording
+        onsets: frame index of each pull onset
+        peaks: frame index of each pull velocity peak
+        direction: unit vector of the pull direction
+    """
+    velocity = np.gradient(keypoint, 1 / fps, axis=0)
+    horizontal = [dim for dim in range(keypoint.shape[1]) if dim != vertical_axis]
+    velocity_horizontal = velocity[:, horizontal]
+    valid = np.all(np.isfinite(velocity_horizontal), axis=1)
+    valid[valid] = np.linalg.norm(velocity_horizontal[valid], axis=1) <= max_velocity
+
+    # main direction of the horizontal motion
+    centered = velocity_horizontal[valid] - velocity_horizontal[valid].mean(axis=0)
+    _, _, components = np.linalg.svd(centered, full_matrices=False)
+    direction = np.zeros(keypoint.shape[1])
+    direction[horizontal] = components[0]
+    velocity_pull = np.where(valid, np.nan_to_num(velocity_horizontal) @ components[0], 0)
+
+    # the subject stands at rest most of the time and is displaced briefly by each pull, so the
+    # position along the pull direction is skewed towards the pull (clipped: robust to tracking errors)
+    position_pull = keypoint[:, horizontal] @ components[0]
+    position_pull = position_pull[valid & np.isfinite(position_pull)]
+    clipped = np.clip(position_pull, *np.percentile(position_pull, [1, 99]))
+    if np.mean((clipped - clipped.mean()) ** 3) < 0:
+        direction, velocity_pull = -direction, -velocity_pull
+
+    if min_peak_velocity is None:
+        min_peak_velocity = 0.5 * np.percentile(velocity_pull, 99)
+    peaks, _ = find_peaks(velocity_pull, height=min_peak_velocity, distance=int(min_interval * fps))
+
+    # a pull has to move the keypoint away from where the velocity peak started
+    position = np.where(valid, keypoint @ direction, np.nan)
+    peaks = np.array(
+        [
+            peak
+            for peak, next_peak in zip(peaks, np.append(peaks[1:], len(keypoint)))
+            if np.nanmax(position[peak:next_peak], initial=-np.inf)
+            - np.nanmin(position[max(0, peak - int(min_interval * fps)) : peak + 1], initial=np.inf)
+            >= min_displacement
+        ],
+        dtype=int,
+    )
+
+    onsets = []
+    previous_peak = 0
+    for peak in peaks:
+        below = np.flatnonzero(velocity_pull[previous_peak:peak] <= onset_fraction * velocity_pull[peak])
+        onsets.append(previous_peak + below[-1] if below.size else previous_peak)
+        previous_peak = peak
+    onsets = np.array(onsets, dtype=int)
+
+    segments = list(zip(onsets, np.append(onsets[1:], len(keypoint))))
+    return segments, onsets, peaks, direction
 
 
 # =========================================== CALIBRATION ===========================================
