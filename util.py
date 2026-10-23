@@ -653,6 +653,23 @@ def resample_keypoints_to_rate(
     return resampled, grid
 
 
+def stereo_to_qualisys_axes(keypoints: np.ndarray) -> np.ndarray:
+    """
+    Rearrange stereo keypoints from the stereo global frame (horizontal, depth, vertical) to the
+    qualisys axis order (depth, horizontal, vertical) and flip the vertical axis so that up is
+    positive (the chessboard frame points the vertical axis down). Swapping two axes alone would
+    mirror the data; the vertical flip makes the whole change a proper rotation.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, 3), in the stereo global frame
+    Returns:
+        keypoints in the qualisys axis order, shape (n_frames, n_kpt, 3)
+    """
+    keypoints_qualisys = keypoints[..., [1, 0, 2]].astype(float, copy=True)
+    keypoints_qualisys[..., 2] *= -1
+    return keypoints_qualisys
+
+
 def get_velocity_and_acceleration(keypoint: np.ndarray, fps: float):
     delta_t = 1 / fps  # frames/sec
     position = keypoint  # point, meters

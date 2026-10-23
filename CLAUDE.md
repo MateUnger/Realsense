@@ -19,6 +19,11 @@ Markerless 3D human motion capture with an Intel RealSense depth camera, validat
 - `test.ipynb`: the work-in-progress notebook where new code is developed before moving to `util.py`. It holds the main end-to-end pipeline (streaming, recording, conversion, 2D/3D keypoints, calibration, Qualisys preprocessing, comparison), followed by "Small tests" experiments (Kalman, Savitzky-Golay, outlier rejection, detector selection). Each section is a self-contained cell that sets `recording_name` and reads and writes files on disk, so stages can be rerun on their own. Passthrough stages, duplicated helpers and out-of-date functions are expected while work is in progress; don't clean them up unless asked.
 - `Gait.ipynb`, `PullTest.ipynb`: analysis notebooks for gait (`w*`) and pull-test (`pq*`, `p*`) recordings. They are older than `util.py`: they redefine functions that now exist in `util.py` and call `load_keypoints_and_labels(npz_data_path=...)`, while the current parameter name is `filename`.
 
+## Working style
+
+- Work iteratively, starting from the simplest solution. Each step adds one change (e.g. one filter, one parameter, one new rule), and the user checks the result before the next step. Don't bundle several improvements into one edit, even if they all seem needed; list the other ideas as possible next steps instead.
+- Use descriptive variable names everywhere, including loop counters and indices (e.g. `peak_number`, `peak_index`, `sample_index`, not `i`, `j`, `k`, `p`).
+
 ## Data pipeline (per recording in `data/<name>/`)
 
 Each stage writes a file that the next stage reads. All files are named `<name>_<suffix>`:
@@ -39,6 +44,6 @@ Data files (`*.npy`, `*.npz`, `*.json`, `*.mp4`, `*.tsv`, ...) are gitignored.
 - Keypoint arrays are always shaped `(frames, keypoints, dims)` and use NaN for missing values. Filters must keep NaN gaps intact: `filter_keypoints_median_butter` interpolates gaps shorter than `gap_size` seconds and filters each contiguous valid segment separately.
 - The camera is physically rotated 90°. Pose estimation runs on portrait frames, but depth and intrinsics are landscape. Step 5 maps `x_landscape = y_portrait`, `y_landscape = H - 1 - x_portrait`. Don't change this mapping or the axis order of the 3D output; the comment in the code warns that doing so breaks the spatial calibration.
 - Sampling rates differ: RealSense nominally runs at 60/90 fps (`metadata["fps"]`), but actually at 59.755 / 89.868 fps; using the nominal rate drifts ~0.25 s/min against Qualisys (100 Hz). `get_frame_times` cleans `_timestamps.bin` (startup dropout, duplicated frames) and returns the frames to keep, their times and the actual fps; `resample_keypoints_to_rate` resamples onto a 100 Hz grid with those times (`resample_keypoints` assumes a round rate ratio). The two streams are aligned with hand-picked offsets (`stereo_cut`, `qualisys_cut`), not timestamps.
-- Axis order differs between systems: Qualisys uses (depth, horizontal, vertical) and the stereo global frame uses (horizontal, depth, vertical).
+- Axis order differs between systems: Qualisys uses (depth, horizontal, vertical) and the stereo global frame uses (horizontal, depth, vertical). At the end of stereo preprocessing, `stereo_to_qualisys_axes` reorders the stereo keypoints into the Qualisys order and flips the vertical axis so up is positive (the chessboard frame points down). After that, both systems share the same axes and can be indexed the same way.
 - Label sets: `labels_17` and `labels_26` (Halpe26), each extended with `mid_shoulder` / `mid_hip`. Index keypoints with `labels.index(name)`.
 - `util.get_extrinsics` is stale: it reads `./calibration_metadata.json` and unpacks three values from `get_image_points`, which returns two. The working calibration code is the calibration cell in `test.ipynb`.
