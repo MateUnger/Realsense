@@ -94,13 +94,15 @@ class Step:
         FC: FC event, the foot leaves the ground
         IC: IC event of the same foot, the foot lands again
         step_length: straight-line distance (m) of the ankle between FC and IC, set by set_step_length
+        step_velocity: average ankle velocity (m/s) between FC and IC, set by set_step_velocity
         type: corrective (the ankle moves away from the baseline position) or return (it moves back
-            toward it), set by set_type
+            toward it), set by set_type; None if a position needed for the decision is NaN
     """
 
     FC: GaitEvent
     IC: GaitEvent
     step_length: float | None = field(default=None, init=False)
+    step_velocity: float | None = field(default=None, init=False)
     type: Literal["corrective", "return"] | None = field(default=None, init=False)
 
     def __post_init__(self):
@@ -127,10 +129,22 @@ class Step:
         ankle = keypoints[:, labels.index(f"{self.side}_ankle"), :]
         self.step_length = float(np.linalg.norm(ankle[self.IC.frame] - ankle[self.FC.frame]))
 
+    def set_step_velocity(self, fps: float):
+        """
+        Step length divided by the step duration (FC to IC). Needs set_step_length first.
+
+        Args:
+            fps: sampling rate of the keypoints the events were detected on
+        """
+        if self.step_length is None:
+            raise ValueError("call set_step_length before set_step_velocity")
+        step_duration = (self.IC.frame - self.FC.frame) / fps
+        self.step_velocity = self.step_length / step_duration
+
     def set_type(self, keypoints: np.ndarray, labels: list[str], baseline_position: np.ndarray):
         """
         Corrective if the ankle lands farther from the baseline position than where it lifted off,
-        return if it lands closer.
+        return if it lands closer. None if the baseline or the ankle at FC or IC is NaN.
 
         Args:
             keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
@@ -141,10 +155,33 @@ class Step:
         ankle = keypoints[:, labels.index(f"{self.side}_ankle"), :]
         distance_at_lift_off = np.linalg.norm(ankle[self.FC.frame] - baseline_position)
         distance_at_landing = np.linalg.norm(ankle[self.IC.frame] - baseline_position)
-        self.type = "corrective" if distance_at_landing > distance_at_lift_off else "return"
+        # a NaN distance would fail the comparison and silently give "return"
+        if np.isnan(distance_at_lift_off) or np.isnan(distance_at_landing):
+            self.type = None
+        else:
+            self.type = "corrective" if distance_at_landing > distance_at_lift_off else "return"
 
 
 class Pull:
+    """
+    One pull of a pull test: the segment of the recording from shortly before the pull onset up to
+    the start of the next pull, with the steps taken in it and the per-pull metrics.
+
+    Attributes:
+        start: first frame of the segment (pull onset minus the baseline period)
+        end: first frame after the segment (start of the next pull or end of the recording)
+        pull_onset: frame where the pull starts
+        baseline_ankle_position: (3,) mean position of both ankles from start up to pull_onset,
+            set by set_baseline_ankle_position
+        steps: steps whose FC falls between pull_onset and end, set by set_steps
+        first_corrective_step_latency: time (s) from pull_onset to the FC of the first corrective
+            step, set by set_first_corrective_step_latency
+        corrective_step_count: number of corrective steps (both feet), set by
+            set_corrective_step_count
+        first_corrective_step, first_corrective_step_length, first_corrective_step_velocity:
+            properties computed from steps
+    """
+
     def __init__(self, start, end, pull_onset):
         self.start = start
         self.end = end
@@ -152,7 +189,11 @@ class Pull:
         self.baseline_ankle_position: np.ndarray | None = (
             None  # (3,), set by set_baseline_ankle_position
         )
-        self.steps: list[Step] = []  # steps whose FC falls in this segment, set by set_steps
+        self.steps: list[Step] = []  # steps whose FC falls after the pull onset, set by set_steps
+        self.first_corrective_step_latency: float | None = (
+            None  # s, set by set_first_corrective_step_latency
+        )
+        self.corrective_step_count: int | None = None  # set by set_corrective_step_count
 
     def set_baseline_ankle_position(self, keypoints: np.ndarray, labels: list[str]):
         """
@@ -172,8 +213,9 @@ class Pull:
 
     def set_steps(self, steps: list[Step], keypoints: np.ndarray, labels: list[str]):
         """
-        Keep the steps whose FC falls in this segment (start <= FC frame < end) and classify each
-        as corrective or return relative to the baseline ankle position.
+        Keep the steps whose FC falls after the pull onset (pull_onset <= FC frame < end) and
+        classify each as corrective or return relative to the baseline ankle position. Steps during
+        the baseline period are left out.
 
         Args:
             steps: steps of the whole recording, e.g. from get_steps
@@ -182,16 +224,55 @@ class Pull:
         """
         if self.baseline_ankle_position is None:
             raise ValueError("call set_baseline_ankle_position before set_steps")
-        self.steps = [step for step in steps if self.start <= step.FC.frame < self.end]
+        self.steps = [step for step in steps if self.pull_onset <= step.FC.frame < self.end]
         for step in self.steps:
             step.set_type(keypoints, labels, self.baseline_ankle_position)
+
+    def set_first_corrective_step_latency(self, fps: float) -> None:
+        """Time (s) from the pull onset to the lift-off (FC) of the first corrective step;
+        None if the pull has no corrective step."""
+        if self.first_corrective_step is None:
+            self.first_corrective_step_latency = None
+            return
+        self.first_corrective_step_latency = (
+            self.first_corrective_step.FC.frame - self.pull_onset
+        ) / fps
+
+    def set_corrective_step_count(self) -> None:
+        """Number of corrective steps in this pull (both feet)."""
+        self.corrective_step_count = sum(step.type == "corrective" for step in self.steps)
+
+    @property
+    def first_corrective_step(self) -> Step | None:
+        """Corrective step with the earliest lift-off (FC); None if the pull has none."""
+        corrective_steps = [step for step in self.steps if step.type == "corrective"]
+        if not corrective_steps:
+            return None
+        return min(corrective_steps, key=lambda step: step.FC.frame)
+
+    @property
+    def first_corrective_step_length(self) -> float | None:
+        """Step length (m) of the first corrective step; None if the pull has none."""
+        if self.first_corrective_step is None:
+            return None
+        return self.first_corrective_step.step_length
+
+    @property
+    def first_corrective_step_velocity(self) -> float | None:
+        """Step velocity (m/s) of the first corrective step; None if the pull has none."""
+        if self.first_corrective_step is None:
+            return None
+        return self.first_corrective_step.step_velocity
 
     def __repr__(self):
         # short form, used when a list of pulls is displayed
         return f"Pull(start={self.start}, end={self.end}, pull_onset={self.pull_onset}, steps={len(self.steps)})"
 
     def __str__(self):
-        # full form, used by print(pull): segment, baseline and one row per step
+        # full form, used by print(pull): every attribute and property, then one row per step
+        def format_value(value, unit=""):
+            return "not set" if value is None else f"{value:.2f}{unit}"
+
         if self.baseline_ankle_position is None:
             baseline_text = "not set"
         else:
@@ -200,13 +281,21 @@ class Pull:
             f"Pull: frames {self.start}-{self.end}, onset {self.pull_onset}",
             f"  baseline ankle position: {baseline_text}",
             f"  steps: {len(self.steps)}",
+            f"  corrective step count: {self.corrective_step_count}",
+            f"  first corrective step latency: {format_value(self.first_corrective_step_latency, ' s')}",
+            f"  first corrective step length: {format_value(self.first_corrective_step_length, ' m')}",
+            f"  first corrective step velocity: {format_value(self.first_corrective_step_velocity, ' m/s')}",
         ]
         if self.steps:
-            lines.append(f"    {'type':<12}{'side':<7}{'FC':>6}{'IC':>6}{'length':>8}")
+            lines.append(
+                f"    {'type':<12}{'side':<7}{'FC':>6}{'IC':>6}{'length':>8}{'velocity':>10}"
+            )
             for step in self.steps:
                 length_text = "-" if step.step_length is None else f"{step.step_length:.2f}"
+                velocity_text = "-" if step.step_velocity is None else f"{step.step_velocity:.2f}"
                 lines.append(
-                    f"    {str(step.type):<12}{step.side:<7}{step.FC.frame:>6}{step.IC.frame:>6}{length_text:>8}"
+                    f"    {str(step.type):<12}{step.side:<7}{step.FC.frame:>6}{step.IC.frame:>6}"
+                    f"{length_text:>8}{velocity_text:>10}"
                 )
         return "\n".join(lines)
 
@@ -293,10 +382,14 @@ class Recording:
         self.steps = get_steps(
             self.gait_events, self.keypoints, self.labels, min_step_length=min_step_length
         )
+        for step in self.steps:
+            step.set_step_velocity(self.fps)
 
         for pull in self.pulls:
             pull.set_baseline_ankle_position(self.keypoints, self.labels)
             pull.set_steps(self.steps, self.keypoints, self.labels)
+            pull.set_first_corrective_step_latency(self.fps)
+            pull.set_corrective_step_count()
 
     def plot(self):
         """
@@ -340,13 +433,21 @@ class Recording:
             ankle_speed = get_ankle_speed(self.keypoints, self.labels, side, self.fps)
             if self.speed_threshold is not None:
                 stages = get_ground_contact_stages(
-                    ankle_speed, self.fps, self.speed_threshold, self.min_swing_time, self.min_stance_time
+                    ankle_speed,
+                    self.fps,
+                    self.speed_threshold,
+                    self.min_swing_time,
+                    self.min_stance_time,
                 )
-                stages_ax.set_title(f"{side} ankle ground contact (1 = on the ground), offset per stage")
+                stages_ax.set_title(
+                    f"{side} ankle ground contact (1 = on the ground), offset per stage"
+                )
                 stage_count = len(stages)
                 for stage_number, (stage_name, ground_contact) in enumerate(stages.items()):
                     stages_ax.plot(
-                        frames, ground_contact + 2 * (stage_count - 1 - stage_number), label=stage_name
+                        frames,
+                        ground_contact + 2 * (stage_count - 1 - stage_number),
+                        label=stage_name,
                     )
                 stages_ax.set_yticks([])
 
