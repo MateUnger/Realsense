@@ -178,6 +178,13 @@ class Pull:
             step, set by set_first_corrective_step_latency
         corrective_step_count: number of corrective steps (both feet), set by
             set_corrective_step_count
+        baseline_torso: (3,) mean torso vector (mid_hip -> mid_shoulder) from start up to
+            pull_onset, set by set_baseline_torso
+        max_torso_angle: largest angle (deg) between the torso and baseline_torso from pull_onset
+            up to end, set by set_max_torso_angle
+        max_torso_angle_frame: frame of max_torso_angle, set by set_max_torso_angle
+        recovery_time: time (s) from pull_onset until the torso angle falls back to a fraction
+            (default 75%) of max_torso_angle after the maximum, set by set_recovery_time
         first_corrective_step, first_corrective_step_length, first_corrective_step_velocity:
             properties computed from steps
     """
@@ -194,6 +201,10 @@ class Pull:
             None  # s, set by set_first_corrective_step_latency
         )
         self.corrective_step_count: int | None = None  # set by set_corrective_step_count
+        self.baseline_torso: np.ndarray | None = None  # (3,), set by set_baseline_torso
+        self.max_torso_angle: float | None = None  # deg, set by set_max_torso_angle
+        self.max_torso_angle_frame: int | None = None  # set by set_max_torso_angle
+        self.recovery_time: float | None = None  # s, set by set_recovery_time
 
     def set_baseline_ankle_position(self, keypoints: np.ndarray, labels: list[str]):
         """
@@ -242,6 +253,94 @@ class Pull:
         """Number of corrective steps in this pull (both feet)."""
         self.corrective_step_count = sum(step.type == "corrective" for step in self.steps)
 
+    def set_baseline_torso(self, keypoints: np.ndarray, labels: list[str]):
+        """
+        Mean torso vector (mid_hip -> mid_shoulder) during the baseline period (start up to the
+        pull onset).
+
+        Args:
+            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+                like start and pull_onset
+            labels: keypoint labels, must contain "mid_hip" and "mid_shoulder"
+        """
+        baseline_torso_vectors = get_torso_vectors(keypoints, labels)[self.start : self.pull_onset]
+        # nanmean, so frames where a keypoint is missing don't make the whole baseline NaN
+        self.baseline_torso = np.nanmean(baseline_torso_vectors, axis=0)
+
+    def get_torso_angles(self, keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
+        """
+        3D angle (deg) between the torso vector and the baseline torso vector for every frame from
+        the pull onset up to the end of the segment; NaN where the torso is missing.
+
+        Args:
+            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+                like pull_onset and end
+            labels: keypoint labels, must contain "mid_hip" and "mid_shoulder"
+        Returns:
+            (end - pull_onset,) angles; index 0 is the pull onset frame
+        """
+        if self.baseline_torso is None:
+            raise ValueError("call set_baseline_torso before get_torso_angles")
+        torso_vectors = get_torso_vectors(keypoints, labels)[self.pull_onset : self.end]
+        cosines = (torso_vectors @ self.baseline_torso) / (
+            np.linalg.norm(torso_vectors, axis=1) * np.linalg.norm(self.baseline_torso)
+        )
+        # clip, since rounding can push the cosine just outside [-1, 1] where arccos is NaN
+        return np.degrees(np.arccos(np.clip(cosines, -1, 1)))
+
+    def set_max_torso_angle(self, keypoints: np.ndarray, labels: list[str]):
+        """
+        Largest torso angle (deg, see get_torso_angles) and its frame; None if the torso is missing
+        in every frame.
+
+        Args:
+            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+                like pull_onset and end
+            labels: keypoint labels, must contain "mid_hip" and "mid_shoulder"
+        """
+        torso_angles = self.get_torso_angles(keypoints, labels)
+        if np.all(np.isnan(torso_angles)):
+            self.max_torso_angle = None
+            self.max_torso_angle_frame = None
+            return
+        max_angle_index = int(np.nanargmax(torso_angles))
+        self.max_torso_angle = float(torso_angles[max_angle_index])
+        self.max_torso_angle_frame = self.pull_onset + max_angle_index
+
+    def set_recovery_time(
+        self,
+        keypoints: np.ndarray,
+        labels: list[str],
+        fps: float,
+        recovery_fraction: float = 0.75,
+    ):
+        """
+        Time (s) from the pull onset to the first frame after the maximum where the torso angle is
+        back to recovery_fraction of the maximal angle or less; None if that doesn't happen before
+        the end of the segment.
+
+        Args:
+            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+                like pull_onset and end
+            labels: keypoint labels, must contain "mid_hip" and "mid_shoulder"
+            fps: sampling rate of the keypoints
+            recovery_fraction: fraction of the maximal angle that counts as recovered
+        """
+        if self.max_torso_angle_frame is None:
+            self.recovery_time = None
+            return
+        torso_angles = self.get_torso_angles(keypoints, labels)
+        max_angle_index = self.max_torso_angle_frame - self.pull_onset
+        # NaN angles fail the comparison, so missing frames never count as recovered
+        recovered_indices = np.flatnonzero(
+            torso_angles[max_angle_index:] <= recovery_fraction * self.max_torso_angle
+        )
+        if len(recovered_indices) == 0:
+            self.recovery_time = None
+            return
+        recovery_index = max_angle_index + int(recovered_indices[0])
+        self.recovery_time = recovery_index / fps
+
     @property
     def first_corrective_step(self) -> Step | None:
         """Corrective step with the earliest lift-off (FC); None if the pull has none."""
@@ -273,13 +372,15 @@ class Pull:
         def format_value(value, unit=""):
             return "not set" if value is None else f"{value:.2f}{unit}"
 
-        if self.baseline_ankle_position is None:
-            baseline_text = "not set"
-        else:
-            baseline_text = np.array2string(self.baseline_ankle_position, precision=3)
+        def format_vector(vector):
+            return "not set" if vector is None else np.array2string(vector, precision=3)
+
         lines = [
             f"Pull: frames {self.start}-{self.end}, onset {self.pull_onset}",
-            f"  baseline ankle position: {baseline_text}",
+            f"  baseline ankle position: {format_vector(self.baseline_ankle_position)}",
+            f"  baseline torso: {format_vector(self.baseline_torso)}",
+            f"  max torso angle: {format_value(self.max_torso_angle, ' deg')}, frame {self.max_torso_angle_frame}",
+            f"  recovery time: {format_value(self.recovery_time, ' s')}",
             f"  steps: {len(self.steps)}",
             f"  corrective step count: {self.corrective_step_count}",
             f"  first corrective step latency: {format_value(self.first_corrective_step_latency, ' s')}",
@@ -390,6 +491,9 @@ class Recording:
             pull.set_steps(self.steps, self.keypoints, self.labels)
             pull.set_first_corrective_step_latency(self.fps)
             pull.set_corrective_step_count()
+            pull.set_baseline_torso(self.keypoints, self.labels)
+            pull.set_max_torso_angle(self.keypoints, self.labels)
+            pull.set_recovery_time(self.keypoints, self.labels, self.fps)
 
     def plot(self):
         """
@@ -524,6 +628,11 @@ def fill_short_runs(binary_signal: np.ndarray, value: int, min_length: int) -> n
         ):
             filled_signal[run_start:run_end] = 1 - value
     return filled_signal
+
+
+def get_torso_vectors(keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
+    """Torso vector mid_hip -> mid_shoulder for every frame; (frames, 3)."""
+    return keypoints[:, labels.index("mid_shoulder"), :] - keypoints[:, labels.index("mid_hip"), :]
 
 
 def get_ankle_speed(keypoints: np.ndarray, labels: list[str], side: str, fps: float) -> np.ndarray:

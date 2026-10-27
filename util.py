@@ -689,6 +689,81 @@ def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
     return velocity, acceleration
 
 
+def normalize_vector(vector: np.ndarray):
+    """
+    Returns the unit vector of the input vector.
+
+    Args:
+        vector: input vector
+
+    Returns:
+        normalized_vector: unit vector of magnitude 1 with the same direction as the input
+    """
+    return vector / np.linalg.norm(vector)
+
+
+def angle_between_vectors(vector_1: np.ndarray, vector_2: np.ndarray):
+    """
+    Returns the angle in degrees between vectors 'vector_1' and 'vector_2'
+
+    Args:
+        vector_1: input vector
+        vector_2: other input vector
+    Returns:
+        angle: angle between the two input vectors in degrees.
+
+    """
+    # calculate unit vectors
+    vector_1_unit = normalize_vector(vector_1)
+    vector_2_unit = normalize_vector(vector_2)
+
+    # get scalar product
+    scalar_product = np.clip(np.dot(vector_1_unit, vector_2_unit), -1, 1)
+
+    # clip scalar product to [-1,1] range so trig. function works normal,
+    # use arccos to get the angle from scalar product
+    angle = np.degrees(np.arccos(scalar_product))
+
+    return angle
+
+
+def project_vector_on_plane(plane_normal_vector: np.ndarray, vector: np.ndarray):
+    """
+    Project an n-dimensional vector onto an n-dimensional plane defined by its normal (orthogonal) vector.
+
+    Args:
+        plane_normal_vector: vector orthogonal to the reference plane
+        vector: vector to be projected
+    Returns:
+        vector_projection: projection of the input vector onto reference plane
+    """
+    # normalize surface normal
+    normal_vector = plane_normal_vector / np.linalg.norm(plane_normal_vector)
+    # multily vector with its scalar product (dot product w surface normal), shift it
+    vector_projection = vector - np.dot(vector, normal_vector) * normal_vector
+    return vector_projection
+
+
+def get_projection(plane_normal_vectors: np.ndarray, vector_array: np.ndarray):
+    """
+    Project each member of an array of vectors onto plane.
+
+    Args:
+        plane_normal_vector: vector orthogonal to the reference plane
+        vector_array: array of vectors to be projected. Usually a limb for 1 gait-cycle
+
+    Returns:
+        array of projected vectors
+    """
+
+    return np.array(
+        [
+            project_vector_on_plane(plane_normal, vector)
+            for plane_normal, vector in zip(plane_normal_vectors.T, vector_array.T)
+        ]
+    )
+
+
 # =========================================== SEGMENTATION ===========================================
 
 
@@ -769,7 +844,9 @@ def segment_pulls(
     onsets = []
     previous_peak = 0
     for peak in peaks:
-        below = np.flatnonzero(velocity_pull[previous_peak:peak] <= onset_fraction * velocity_pull[peak])
+        below = np.flatnonzero(
+            velocity_pull[previous_peak:peak] <= onset_fraction * velocity_pull[peak]
+        )
         onsets.append(previous_peak + below[-1] if below.size else previous_peak)
         previous_peak = peak
     onsets = np.array(onsets, dtype=int)
