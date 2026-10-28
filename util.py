@@ -577,7 +577,7 @@ def get_frame_times(
     filename: str, n_frames: int | None = None, startup: float = 2.0
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Clean the frame timestamps written during conversion (_timestamps.bin, float64 ms) and
+    Clean the frame timestamps written during conversion (_timestamps_color.bin, float64 ms) and
     estimate the actual frame rate (the camera runs at 59.755 fps in the 60 fps mode and
     89.868 fps in the 90 fps mode; using the nominal rate drifts ~0.25 s/min against qualisys).
 
@@ -587,7 +587,7 @@ def get_frame_times(
     timestamp jitter and keeps dropped frames as gaps in the times.
 
     Args:
-        filename: path to the _timestamps.bin file
+        filename: path to the _timestamps_color.bin file (_timestamps.bin for older conversions)
         n_frames: number of keypoint frames, timestamps beyond it are ignored
         startup: time window (s) at the start in which a dropout is searched for
     Returns:
