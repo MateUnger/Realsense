@@ -171,6 +171,10 @@ class Pull:
         start: first frame of the segment (pull onset minus the baseline period)
         end: first frame after the segment (start of the next pull or end of the recording)
         pull_onset: frame where the pull starts
+        pull_peak_frame: frame of the peak mid shoulder velocity along the pull axis, set by
+            set_pull_magnitude
+        pull_magnitude: peak mid shoulder velocity (m/s) along the pull axis, set by
+            set_pull_magnitude
         baseline_ankle_position: (3,) mean position of both ankles from start up to pull_onset,
             set by set_baseline_ankle_position
         steps: steps whose FC falls between pull_onset and end, set by set_steps
@@ -178,13 +182,13 @@ class Pull:
             step, set by set_first_corrective_step_latency
         corrective_step_count: number of corrective steps (both feet), set by
             set_corrective_step_count
-        baseline_torso: (3,) mean torso vector (mid_hip -> mid_shoulder) from start up to
-            pull_onset, set by set_baseline_torso
-        max_torso_angle: largest angle (deg) between the torso and baseline_torso from pull_onset
-            up to end, set by set_max_torso_angle
-        max_torso_angle_frame: frame of max_torso_angle, set by set_max_torso_angle
-        recovery_time: time (s) from pull_onset until the torso angle falls back to a fraction
-            (default 75%) of max_torso_angle after the maximum, set by set_recovery_time
+        baseline_trunk: (3,) mean trunk vector (mid_hip -> mid_shoulder) from start up to
+            pull_onset, set by set_baseline_trunk
+        max_trunk_angle: largest angle (deg) between the trunk and baseline_trunk from pull_onset
+            up to end, set by set_max_trunk_angle
+        max_trunk_angle_frame: frame of max_trunk_angle, set by set_max_trunk_angle
+        recovery_time: time (s) from pull_onset until the trunk angle falls back to a fraction
+            (default 75%) of max_trunk_angle after the maximum, set by set_recovery_time
         first_corrective_step, first_corrective_step_length, first_corrective_step_velocity:
             properties computed from steps
     """
@@ -193,6 +197,8 @@ class Pull:
         self.start = start
         self.end = end
         self.pull_onset = pull_onset
+        self.pull_peak_frame: int | None = None  # set by set_pull_magnitude
+        self.pull_magnitude: float | None = None  # m/s, set by set_pull_magnitude
         self.baseline_ankle_position: np.ndarray | None = (
             None  # (3,), set by set_baseline_ankle_position
         )
@@ -201,10 +207,22 @@ class Pull:
             None  # s, set by set_first_corrective_step_latency
         )
         self.corrective_step_count: int | None = None  # set by set_corrective_step_count
-        self.baseline_torso: np.ndarray | None = None  # (3,), set by set_baseline_torso
-        self.max_torso_angle: float | None = None  # deg, set by set_max_torso_angle
-        self.max_torso_angle_frame: int | None = None  # set by set_max_torso_angle
+        self.baseline_trunk: np.ndarray | None = None  # (3,), set by set_baseline_trunk
+        self.max_trunk_angle: float | None = None  # deg, set by set_max_trunk_angle
+        self.max_trunk_angle_frame: int | None = None  # set by set_max_trunk_angle
         self.recovery_time: float | None = None  # s, set by set_recovery_time
+
+    def set_pull_magnitude(self, shoulder_velocity: np.ndarray, peak_frame: int):
+        """
+        Pull magnitude: mid shoulder velocity along the pull axis at the pull's velocity peak.
+
+        Args:
+            shoulder_velocity: (frames,) mid shoulder velocity (m/s) along the pull axis of the
+                whole recording, e.g. from get_axis_velocity
+            peak_frame: frame of this pull's velocity peak, from get_pull_onsets
+        """
+        self.pull_peak_frame = int(peak_frame)
+        self.pull_magnitude = float(shoulder_velocity[peak_frame])
 
     def set_baseline_ankle_position(self, keypoints: np.ndarray, labels: list[str]):
         """
@@ -253,9 +271,9 @@ class Pull:
         """Number of corrective steps in this pull (both feet)."""
         self.corrective_step_count = sum(step.type == "corrective" for step in self.steps)
 
-    def set_baseline_torso(self, keypoints: np.ndarray, labels: list[str]):
+    def set_baseline_trunk(self, keypoints: np.ndarray, labels: list[str]):
         """
-        Mean torso vector (mid_hip -> mid_shoulder) during the baseline period (start up to the
+        Mean trunk vector (mid_hip -> mid_shoulder) during the baseline period (start up to the
         pull onset).
 
         Args:
@@ -263,14 +281,14 @@ class Pull:
                 like start and pull_onset
             labels: keypoint labels, must contain "mid_hip" and "mid_shoulder"
         """
-        baseline_torso_vectors = get_torso_vectors(keypoints, labels)[self.start : self.pull_onset]
+        baseline_trunk_vectors = get_trunk_vectors(keypoints, labels)[self.start : self.pull_onset]
         # nanmean, so frames where a keypoint is missing don't make the whole baseline NaN
-        self.baseline_torso = np.nanmean(baseline_torso_vectors, axis=0)
+        self.baseline_trunk = np.nanmean(baseline_trunk_vectors, axis=0)
 
-    def get_torso_angles(self, keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
+    def get_trunk_angles(self, keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
         """
-        3D angle (deg) between the torso vector and the baseline torso vector for every frame from
-        the pull onset up to the end of the segment; NaN where the torso is missing.
+        3D angle (deg) between the trunk vector and the baseline trunk vector for every frame from
+        the pull onset up to the end of the segment; NaN where the trunk is missing.
 
         Args:
             keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
@@ -279,18 +297,18 @@ class Pull:
         Returns:
             (end - pull_onset,) angles; index 0 is the pull onset frame
         """
-        if self.baseline_torso is None:
-            raise ValueError("call set_baseline_torso before get_torso_angles")
-        torso_vectors = get_torso_vectors(keypoints, labels)[self.pull_onset : self.end]
-        cosines = (torso_vectors @ self.baseline_torso) / (
-            np.linalg.norm(torso_vectors, axis=1) * np.linalg.norm(self.baseline_torso)
+        if self.baseline_trunk is None:
+            raise ValueError("call set_baseline_trunk before get_trunk_angles")
+        trunk_vectors = get_trunk_vectors(keypoints, labels)[self.pull_onset : self.end]
+        cosines = (trunk_vectors @ self.baseline_trunk) / (
+            np.linalg.norm(trunk_vectors, axis=1) * np.linalg.norm(self.baseline_trunk)
         )
         # clip, since rounding can push the cosine just outside [-1, 1] where arccos is NaN
         return np.degrees(np.arccos(np.clip(cosines, -1, 1)))
 
-    def set_max_torso_angle(self, keypoints: np.ndarray, labels: list[str]):
+    def set_max_trunk_angle(self, keypoints: np.ndarray, labels: list[str]):
         """
-        Largest torso angle (deg, see get_torso_angles) and its frame; None if the torso is missing
+        Largest trunk angle (deg, see get_trunk_angles) and its frame; None if the trunk is missing
         in every frame.
 
         Args:
@@ -298,14 +316,14 @@ class Pull:
                 like pull_onset and end
             labels: keypoint labels, must contain "mid_hip" and "mid_shoulder"
         """
-        torso_angles = self.get_torso_angles(keypoints, labels)
-        if np.all(np.isnan(torso_angles)):
-            self.max_torso_angle = None
-            self.max_torso_angle_frame = None
+        trunk_angles = self.get_trunk_angles(keypoints, labels)
+        if np.all(np.isnan(trunk_angles)):
+            self.max_trunk_angle = None
+            self.max_trunk_angle_frame = None
             return
-        max_angle_index = int(np.nanargmax(torso_angles))
-        self.max_torso_angle = float(torso_angles[max_angle_index])
-        self.max_torso_angle_frame = self.pull_onset + max_angle_index
+        max_angle_index = int(np.nanargmax(trunk_angles))
+        self.max_trunk_angle = float(trunk_angles[max_angle_index])
+        self.max_trunk_angle_frame = self.pull_onset + max_angle_index
 
     def set_recovery_time(
         self,
@@ -315,7 +333,7 @@ class Pull:
         recovery_fraction: float = 0.75,
     ):
         """
-        Time (s) from the pull onset to the first frame after the maximum where the torso angle is
+        Time (s) from the pull onset to the first frame after the maximum where the trunk angle is
         back to recovery_fraction of the maximal angle or less; None if that doesn't happen before
         the end of the segment.
 
@@ -326,14 +344,14 @@ class Pull:
             fps: sampling rate of the keypoints
             recovery_fraction: fraction of the maximal angle that counts as recovered
         """
-        if self.max_torso_angle_frame is None:
+        if self.max_trunk_angle_frame is None:
             self.recovery_time = None
             return
-        torso_angles = self.get_torso_angles(keypoints, labels)
-        max_angle_index = self.max_torso_angle_frame - self.pull_onset
+        trunk_angles = self.get_trunk_angles(keypoints, labels)
+        max_angle_index = self.max_trunk_angle_frame - self.pull_onset
         # NaN angles fail the comparison, so missing frames never count as recovered
         recovered_indices = np.flatnonzero(
-            torso_angles[max_angle_index:] <= recovery_fraction * self.max_torso_angle
+            trunk_angles[max_angle_index:] <= recovery_fraction * self.max_trunk_angle
         )
         if len(recovered_indices) == 0:
             self.recovery_time = None
@@ -377,9 +395,10 @@ class Pull:
 
         lines = [
             f"Pull: frames {self.start}-{self.end}, onset {self.pull_onset}",
+            f"  pull magnitude: {format_value(self.pull_magnitude, ' m/s')}, frame {self.pull_peak_frame}",
             f"  baseline ankle position: {format_vector(self.baseline_ankle_position)}",
-            f"  baseline torso: {format_vector(self.baseline_torso)}",
-            f"  max torso angle: {format_value(self.max_torso_angle, ' deg')}, frame {self.max_torso_angle_frame}",
+            f"  baseline trunk: {format_vector(self.baseline_trunk)}",
+            f"  max trunk angle: {format_value(self.max_trunk_angle, ' deg')}, frame {self.max_trunk_angle_frame}",
             f"  recovery time: {format_value(self.recovery_time, ' s')}",
             f"  steps: {len(self.steps)}",
             f"  corrective step count: {self.corrective_step_count}",
@@ -411,6 +430,7 @@ class Recording:
         labels: keypoint labels
         fps: sampling rate of the keypoints
         pull_onsets: sample index of each pull onset
+        pull_peaks: sample index of each pull's peak mid shoulder velocity
         gait_events: gait events of the whole recording
         steps: steps of the whole recording
         pulls: one Pull per pull onset
@@ -430,6 +450,7 @@ class Recording:
         self.labels = labels
         self.fps = fps
         self.pull_onsets: np.ndarray | None = None
+        self.pull_peaks: np.ndarray | None = None
         self.gait_events: list[GaitEvent] = []
         self.steps: list[Step] = []
         self.pulls: list[Pull] = []
@@ -467,10 +488,13 @@ class Recording:
         shoulder_velocity = get_axis_velocity(
             self.keypoints[:, self.labels.index("mid_shoulder"), :], pull_axis, self.fps
         )
-        _, self.pull_onsets, _ = get_pull_onsets(shoulder_velocity, fps=self.fps)
+        self.pull_peaks, self.pull_onsets, _ = get_pull_onsets(shoulder_velocity, fps=self.fps)
         self.pulls = segment_pulls(
             self.pull_onsets, len(self.keypoints), fps=self.fps, baseline_time=baseline_time
         )
+        # segment_pulls keeps the onset order, so pulls and peaks match one to one
+        for pull, peak_frame in zip(self.pulls, self.pull_peaks):
+            pull.set_pull_magnitude(shoulder_velocity, peak_frame)
 
         self.gait_events = get_gait_events(
             self.keypoints,
@@ -491,8 +515,8 @@ class Recording:
             pull.set_steps(self.steps, self.keypoints, self.labels)
             pull.set_first_corrective_step_latency(self.fps)
             pull.set_corrective_step_count()
-            pull.set_baseline_torso(self.keypoints, self.labels)
-            pull.set_max_torso_angle(self.keypoints, self.labels)
+            pull.set_baseline_trunk(self.keypoints, self.labels)
+            pull.set_max_trunk_angle(self.keypoints, self.labels)
             pull.set_recovery_time(self.keypoints, self.labels, self.fps)
 
     def plot(self):
@@ -513,8 +537,9 @@ class Recording:
 
         shoulder = self.keypoints[:, self.labels.index("mid_shoulder"), :]
         axs[0].set_title("mid shoulder position")
+        axis_labels = ["depth", "vertical", "horizontal"]
         for axis_index in range(3):
-            axs[0].plot(frames, shoulder[:, axis_index], label=f"axis {axis_index}")
+            axs[0].plot(frames, shoulder[:, axis_index], label=axis_labels[axis_index])
         axs[0].set_ylabel("m")
 
         shoulder_velocity = get_axis_velocity(shoulder, self.pull_axis, self.fps)
@@ -528,6 +553,13 @@ class Recording:
                 "mo",
                 markersize=4,
                 label="pull onset",
+            )
+            axs[1].plot(
+                self.pull_peaks,
+                shoulder_velocity[self.pull_peaks],
+                "c*",
+                markersize=4,
+                label="peak velocity",
             )
         axs[1].set_ylabel("m/s")
 
@@ -563,7 +595,7 @@ class Recording:
                     color="r",
                     linestyle="--",
                     linewidth=0.8,
-                    label="threshold",
+                    label="velocity threshold",
                 )
             for step in self.steps:
                 if step.side != side:
@@ -580,7 +612,9 @@ class Recording:
 
         for ax in axs:
             for pull in self.pulls:
-                ax.axvline(pull.start, color="k", linestyle="--", alpha=0.4)
+                ax.axvline(
+                    pull.start, color="k", linestyle="--", alpha=0.4, label="pull segment border"
+                )
             # one legend entry per label, outside the axes so it doesn't cover the data
             handles, labels = ax.get_legend_handles_labels()
             unique_entries = dict(zip(labels, handles))
@@ -630,8 +664,8 @@ def fill_short_runs(binary_signal: np.ndarray, value: int, min_length: int) -> n
     return filled_signal
 
 
-def get_torso_vectors(keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
-    """Torso vector mid_hip -> mid_shoulder for every frame; (frames, 3)."""
+def get_trunk_vectors(keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
+    """trunk vector mid_hip -> mid_shoulder for every frame; (frames, 3)."""
     return keypoints[:, labels.index("mid_shoulder"), :] - keypoints[:, labels.index("mid_hip"), :]
 
 
