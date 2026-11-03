@@ -653,20 +653,30 @@ def resample_keypoints_to_rate(
     return resampled, grid
 
 
-def stereo_to_qualisys_axes(keypoints: np.ndarray) -> np.ndarray:
+def stereo_to_qualisys_axes(
+    keypoints: np.ndarray,
+    axis_order: tuple[int, int, int] = (0, 1, 2),
+    axis_signs: tuple[int, int, int] = (1, 1, -1),
+) -> np.ndarray:
     """
-    Rearrange stereo keypoints from the stereo global frame (horizontal, depth, vertical) to the
-    qualisys axis order (depth, horizontal, vertical) and flip the vertical axis so that up is
-    positive (the chessboard frame points the vertical axis down). Swapping two axes alone would
-    mirror the data; the vertical flip makes the whole change a proper rotation.
+    Rearrange stereo keypoints from the stereo global frame (chessboard frame) to the qualisys
+    axis order and flip axes so that they point the same way. The chessboard frame always points
+    the vertical axis down, but its horizontal axes depend on where the camera and chessboard are
+    placed, so the mapping is set per recording setup:
+        pq1 (default): order (1, 0, 2), signs (1, 1, -1), swap the two horizontal axes, flip vertical
+        tug1: order (0, 1, 2), signs (-1, 1, -1), no swap, flip the first horizontal axis and vertical
+    The mapping has to be a proper rotation (no mirroring): a swap of two axes needs an odd number
+    of flips, no swap needs an even number.
 
     Args:
         keypoints: shape (n_frames, n_kpt, 3), in the stereo global frame
+        axis_order: stereo axis used for each qualisys axis
+        axis_signs: sign applied to each qualisys axis after reordering
     Returns:
         keypoints in the qualisys axis order, shape (n_frames, n_kpt, 3)
     """
-    keypoints_qualisys = keypoints[..., [1, 0, 2]].astype(float, copy=True)
-    keypoints_qualisys[..., 2] *= -1
+    keypoints_qualisys = keypoints[..., list(axis_order)].astype(float, copy=True)
+    keypoints_qualisys *= np.array(axis_signs, dtype=float)
     return keypoints_qualisys
 
 
