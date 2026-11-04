@@ -656,7 +656,7 @@ def resample_keypoints_to_rate(
 def stereo_to_qualisys_axes(
     keypoints: np.ndarray,
     axis_order: tuple[int, int, int] = (0, 1, 2),
-    axis_signs: tuple[int, int, int] = (1, 1, -1),
+    axis_signs: tuple[int, int, int] = (-1, 1, -1),
 ) -> np.ndarray:
     """
     Rearrange stereo keypoints from the stereo global frame (chessboard frame) to the qualisys
