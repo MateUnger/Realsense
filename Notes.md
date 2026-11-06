@@ -61,19 +61,12 @@
     9. step count
     10. max angular velocity
 
-- standing up
+- standing up / sitting down
 
-    11. duration (first movement -> standing still)
+    11. duration (first movement -> standing still, standing -> sitting still?) TODO: ask Julian
     12. trunk bending max angle
     13. trunk bending max angular velocity
     14. max velocity (mid_shoulder)
-
-- sitting down
-
-    15. duration
-    16. trunk bending max angle
-    17. trunk bending max angular velocity
-    18. max velocity (mid_shoulder)
 
 ## Balancing w eyes closed
 1. center of mass movement 
