@@ -699,6 +699,25 @@ def get_velocity_and_acceleration_1D(keypoint: np.ndarray, fps: float):
     return velocity, acceleration
 
 
+def get_segment_vectors(
+    keypoints: np.ndarray, labels: list[str], start_kpt_name: str, end_kpt_name: str
+) -> np.ndarray:
+    """
+    Vector from one keypoint to another for every frame, e.g. right_shoulder -> left_shoulder.
+
+    Args:
+        keypoints: shape (n_frames, n_kpt, n_dims)
+        labels: keypoint labels
+        start_kpt_name: label of the keypoint the vector starts at
+        end_kpt_name: label of the keypoint the vector points to
+    Returns:
+        segment vectors, shape (n_frames, n_dims)
+    """
+    return (
+        keypoints[:, labels.index(end_kpt_name), :] - keypoints[:, labels.index(start_kpt_name), :]
+    )
+
+
 def normalize_vector(vector: np.ndarray):
     """
     Returns the unit vector of the input vector.
