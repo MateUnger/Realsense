@@ -425,7 +425,7 @@ def get_segment_borders(valid: np.ndarray):
     Return starts, ends of contiguous valid (True) segments (end exclusive).
     """
     diff = np.diff(np.concatenate(([0], valid.astype(np.int8), [0])))
-    return zip(np.flatnonzero(diff == 1), np.flatnonzero(diff == -1))
+    return list(zip(np.flatnonzero(diff == 1), np.flatnonzero(diff == -1)))
 
 
 def filter_keypoints_median_butter(
