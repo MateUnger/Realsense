@@ -778,17 +778,17 @@ def get_projection(plane_normal_vectors: np.ndarray, vector_array: np.ndarray):
     Project each member of an array of vectors onto plane.
 
     Args:
-        plane_normal_vector: vector orthogonal to the reference plane
-        vector_array: array of vectors to be projected. Usually a limb for 1 gait-cycle
+        plane_normal_vectors: vectors orthogonal to the reference plane, one per frame, shape (n_frames, n_dims)
+        vector_array: array of vectors to be projected, shape (n_frames, n_dims). Usually a limb for 1 gait-cycle
 
     Returns:
-        array of projected vectors
+        array of projected vectors, shape (n_frames, n_dims)
     """
 
     return np.array(
         [
             project_vector_on_plane(plane_normal, vector)
-            for plane_normal, vector in zip(plane_normal_vectors.T, vector_array.T)
+            for plane_normal, vector in zip(plane_normal_vectors, vector_array)
         ]
     )
 
