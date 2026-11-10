@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks, peak_widths
+from Util.util import fill_short_runs
 
 
 def get_axis_velocity(keypoint, axis=None, fps=100):
@@ -635,33 +636,6 @@ class Recording:
             f"Recording(system={self.system!r}, frames={len(self.keypoints)}, fps={self.fps}, "
             f"pulls={len(self.pulls)}, steps={len(self.steps)})"
         )
-
-
-def fill_short_runs(binary_signal: np.ndarray, value: int, min_length: int) -> np.ndarray:
-    """
-    Flip runs of `value` that are shorter than `min_length` samples to the other value.
-    Runs touching the start or end of the signal are kept, since their real length is unknown.
-
-    Args:
-        binary_signal: array of 0s and 1s
-        value: which runs to check (0 or 1)
-        min_length: minimum run length in samples
-    Returns:
-        copy of the signal with the short runs flipped
-    """
-    filled_signal = binary_signal.copy()
-    change_indices = np.flatnonzero(np.diff(binary_signal)) + 1
-    run_starts = np.concatenate([[0], change_indices])
-    run_ends = np.concatenate([change_indices, [len(binary_signal)]])
-    for run_start, run_end in zip(run_starts, run_ends):
-        is_interior_run = run_start > 0 and run_end < len(binary_signal)
-        if (
-            binary_signal[run_start] == value
-            and is_interior_run
-            and run_end - run_start < min_length
-        ):
-            filled_signal[run_start:run_end] = 1 - value
-    return filled_signal
 
 
 def get_trunk_vectors(keypoints: np.ndarray, labels: list[str]) -> np.ndarray:

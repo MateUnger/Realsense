@@ -428,6 +428,33 @@ def get_segment_borders(valid: np.ndarray):
     return list(zip(np.flatnonzero(diff == 1), np.flatnonzero(diff == -1)))
 
 
+def fill_short_runs(binary_signal: np.ndarray, value: int, min_length: int) -> np.ndarray:
+    """
+    Flip runs of `value` that are shorter than `min_length` samples to the other value.
+    Runs touching the start or end of the signal are kept, since their real length is unknown.
+
+    Args:
+        binary_signal: array of 0s and 1s
+        value: which runs to check (0 or 1)
+        min_length: minimum run length in samples
+    Returns:
+        copy of the signal with the short runs flipped
+    """
+    filled_signal = binary_signal.copy()
+    change_indices = np.flatnonzero(np.diff(binary_signal)) + 1
+    run_starts = np.concatenate([[0], change_indices])
+    run_ends = np.concatenate([change_indices, [len(binary_signal)]])
+    for run_start, run_end in zip(run_starts, run_ends):
+        is_interior_run = run_start > 0 and run_end < len(binary_signal)
+        if (
+            binary_signal[run_start] == value
+            and is_interior_run
+            and run_end - run_start < min_length
+        ):
+            filled_signal[run_start:run_end] = 1 - value
+    return filled_signal
+
+
 def filter_keypoints_median_butter(
     keypoints: np.ndarray,
     sampling_rate: float,

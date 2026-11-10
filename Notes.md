@@ -55,11 +55,11 @@
     6. stride velocity
     7. max trunk bending angle
 
-- turning 
+- turning (2x? TODO: ask Julian)
 
     8. duration
     9. step count
-    10. max angular velocity
+    10. max angular velocity (wont work)
 
 - standing up / sitting down
 
