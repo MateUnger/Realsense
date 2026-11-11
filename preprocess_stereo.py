@@ -346,6 +346,11 @@ def keypoints_2d(recording_name: str):
     mid_hip = np.expand_dims(np.array(mid_hip), axis=1)
     keypoints_2d_array = np.hstack((keypoints_2d_array, mid_hip))
 
+    # add center_of_mass (com_fraction of the way from mid_hip to mid_shoulder)
+    com_fraction = 0.15
+    center_of_mass = mid_hip + com_fraction * (mid_shoulder - mid_hip)
+    keypoints_2d_array = np.hstack((keypoints_2d_array, center_of_mass))
+
     np.save(out_filename_keypoints_2d, keypoints_2d_array)
     print(f"shape of keypoints_2d:  {keypoints_2d_array.shape}")
 

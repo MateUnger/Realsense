@@ -142,6 +142,7 @@ labels_26 = [
     "right_heel",
     "mid_shoulder",
     "mid_hip",
+    "center_of_mass",
 ]
 
 
@@ -165,6 +166,7 @@ labels_17 = [
     "right_ankle",
     "mid_shoulder",
     "mid_hip",
+    "center_of_mass",
 ]
 
 
@@ -1153,14 +1155,20 @@ def get_qualisys_keypoints(filename: str) -> tuple[np.ndarray, list]:
     right_shoulder = keypoints[labels.index("right_shoulder"), :]
     mid_shoulder = np.mean((left_shoulder, right_shoulder), axis=0)
 
+    # calculate center_of_mass keypoint (com_fraction of the way from mid_hip to mid_shoulder)
+    com_fraction = 0.15
+    center_of_mass = mid_hip_front + com_fraction * (mid_shoulder - mid_hip_front)
+
     # add new keypoints and labels to existing keypoints and labels
     keypoints = np.concatenate((keypoints, mid_shoulder[np.newaxis, :, :]), axis=0)
     # keypoints = np.concatenate((keypoints, mid_hip_back[np.newaxis, :, :]), axis=0)
     keypoints = np.concatenate((keypoints, mid_hip_front[np.newaxis, :, :]), axis=0)
+    keypoints = np.concatenate((keypoints, center_of_mass[np.newaxis, :, :]), axis=0)
 
     keypoints = keypoints.transpose(2, 0, 1)
     labels.append("mid_shoulder")
     labels.append("mid_hip")
+    labels.append("center_of_mass")
 
     return keypoints, labels
 
