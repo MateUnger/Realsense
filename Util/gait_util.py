@@ -3,8 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks, peak_widths, envelope
 from dataclasses import dataclass, make_dataclass
-from Util.util import angle_between_vectors, get_projection
-from Util.pulltest_util import GaitEvent
+from Util.util import angle_between_vectors, get_projection, GaitEvent
 from typing import Literal
 
 # gait parameters to be calculated later

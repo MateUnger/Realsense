@@ -3,7 +3,13 @@ from dataclasses import dataclass, field
 from typing import Literal
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks, peak_widths
-from Util.util import fill_short_runs
+from Util.util import (
+    fill_short_runs,
+    GaitEvent,
+    get_ankle_speed,
+    get_ground_contact_stages,
+    get_gait_events,
+)
 
 
 def get_axis_velocity(keypoint, axis=None, fps=100):
@@ -47,43 +53,6 @@ def segment_pulls(pull_onsets, sample_count, fps=100, baseline_time=0.5):
         Pull(start=segment_start, end=segment_end, pull_onset=int(onset))
         for onset, segment_start, segment_end in zip(pull_onsets, segment_starts, segment_ends)
     ]
-
-
-@dataclass
-class GaitEvent:
-    """
-    Dataclass to store data related to a single Gait Event.
-
-    Attributes:
-        type: Initial Contact (IC) or Final Contact (FC)
-        frame: point of time (frame) at which the event occured
-        side: foot (left/right) the event belongs to
-        perspective: perspective (front/back) of segment to which the event belong to
-        segment: indicates whether the segment contains straight walking or turning action
-        segment_index: index of segment (starting from 0 at the beginning of recording). Incremented with perspective change
-        relative_position: position of the event within the segment, relative to the segment's end (1=segment start in time, 0=segment end)
-    """
-
-    type: Literal["IC", "FC"]
-    frame: int
-    side: Literal["left", "right"]
-    perspective: Literal["front", "back"] | None = None
-    segment: Literal["straight", "turn"] | None = None
-    segment_index: int | None = None
-    relative_position: float | None = None
-
-    def __str__(self):
-        # one table row; str() so that None fields can be padded
-        fields = [
-            self.type,
-            self.side,
-            self.frame,
-            self.perspective,
-            self.segment,
-            self.segment_index,
-            self.relative_position,
-        ]
-        return "".join(f"{str(field):<10}" for field in fields)
 
 
 @dataclass
@@ -643,99 +612,6 @@ def get_trunk_vectors(keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
     return keypoints[:, labels.index("mid_shoulder"), :] - keypoints[:, labels.index("mid_hip"), :]
 
 
-def get_ankle_speed(keypoints: np.ndarray, labels: list[str], side: str, fps: float) -> np.ndarray:
-    """3D speed (m/s) of the "<side>_ankle" keypoint, from frame-to-frame differences; (frames,)."""
-    ankle = keypoints[:, labels.index(f"{side}_ankle"), :]
-    return np.linalg.norm(np.diff(ankle, axis=0, prepend=ankle[[0]]), axis=1) * fps
-
-
-def get_ground_contact_stages(
-    ankle_speed: np.ndarray,
-    fps: float,
-    speed_threshold: float,
-    min_swing_time: float,
-    min_stance_time: float,
-    event_mask: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    """
-    Ground contact signal (1 = on the ground) after each cleaning stage, in order:
-    "raw" (speed below threshold), "masked" (on the ground outside event_mask),
-    "no short swings", "no short contacts". The last one is the final result.
-    """
-    ground_contact_raw = (ankle_speed < speed_threshold).astype(int)
-    # outside the mask the foot is treated as on the ground, so no events are created there
-    if event_mask is None:
-        ground_contact_masked = ground_contact_raw
-    else:
-        ground_contact_masked = np.where(event_mask, ground_contact_raw, 1)
-    ground_contact_no_short_swing = fill_short_runs(
-        ground_contact_masked, value=0, min_length=round(min_swing_time * fps)
-    )
-    ground_contact_no_short_contact = fill_short_runs(
-        ground_contact_no_short_swing, value=1, min_length=round(min_stance_time * fps)
-    )
-    return {
-        "raw": ground_contact_raw,
-        "masked": ground_contact_masked,
-        "no short swings": ground_contact_no_short_swing,
-        "no short contacts": ground_contact_no_short_contact,
-    }
-
-
-def get_gait_events(
-    keypoints: np.ndarray,
-    labels: list[str],
-    fps: float,
-    speed_threshold: float,
-    min_swing_time: float,
-    min_stance_time: float,
-    event_mask: np.ndarray | None = None,
-    show_debug_figure: bool = False,
-) -> list[GaitEvent]:
-    """
-    Initial and final contacts from ankle speed: the foot is on the ground while its 3D speed is
-    below `speed_threshold`. Swing and stance periods that are too short are merged into their neighbours.
-    The returned events only have type, frame and side; context (gait segment, pull, ...) is up to the caller.
-
-    Args:
-        keypoints: (frames, keypoints, 3) positions in meters
-        labels: keypoint labels, must contain "left_ankle" and "right_ankle"
-        fps: sampling rate of the positions
-        speed_threshold: ankle speed (m/s) below which the foot counts as on the ground
-        min_swing_time: swing periods shorter than this (s) are treated as ground contact
-        min_stance_time: stance periods shorter than this (s) are treated as swing
-        event_mask: (frames,) bool, True where events are allowed (e.g. straight walking); None = everywhere
-        show_debug_figure: if True, a debug figure per side is shown
-    Returns:
-        events of all sides, sorted by frame
-    """
-    all_events = []
-    for side in ["left", "right"]:
-        ankle_speed = get_ankle_speed(keypoints, labels, side, fps)
-        stages = get_ground_contact_stages(
-            ankle_speed, fps, speed_threshold, min_swing_time, min_stance_time, event_mask
-        )
-        ground_contact = stages["no short contacts"]
-
-        contact_changes = np.diff(ground_contact, prepend=ground_contact[0])
-        initial_contact_frames = np.flatnonzero(contact_changes == 1)
-        final_contact_frames = np.flatnonzero(contact_changes == -1)
-
-        all_events += [
-            GaitEvent(type="IC", frame=int(frame), side=side) for frame in initial_contact_frames
-        ]
-        all_events += [
-            GaitEvent(type="FC", frame=int(frame), side=side) for frame in final_contact_frames
-        ]
-
-        if show_debug_figure:
-            plot_gait_event_debug_figure(
-                ankle_speed, speed_threshold, stages, title=f"{side} ankle"
-            )
-
-    return sorted(all_events, key=lambda event: event.frame)
-
-
 def get_steps(
     gait_events: list[GaitEvent],
     keypoints: np.ndarray,
@@ -768,27 +644,3 @@ def get_steps(
                 if not step.step_length < min_step_length:
                     steps.append(step)
     return sorted(steps, key=lambda step: step.FC.frame)
-
-
-def plot_gait_event_debug_figure(
-    ankle_speed, speed_threshold, ground_contact_stages: dict, title: str = ""
-):
-    """Ankle speed with the threshold, and the ground contact signal after each cleaning stage."""
-    fig, axs = plt.subplots(2, 1, figsize=(14, 3), sharex=True)
-    fig.suptitle(title)
-
-    axs[0].set_title("ankle speed")
-    axs[0].plot(ankle_speed, label="speed")
-    axs[0].axhline(speed_threshold, color="r", linestyle="--", label="threshold")
-
-    axs[1].set_title("ground contact (1 = on the ground), offset per stage")
-    stage_count = len(ground_contact_stages)
-    for stage_number, (stage_name, ground_contact) in enumerate(ground_contact_stages.items()):
-        axs[1].plot(ground_contact + 2 * (stage_count - 1 - stage_number), label=stage_name)
-
-    for ax in axs:
-        # outside the axes, to the right, so it doesn't cover the data
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
-        ax.grid()
-    plt.tight_layout()
-    return fig
