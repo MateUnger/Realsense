@@ -1,14 +1,15 @@
 import numpy as np
-from dataclasses import dataclass, field
 from typing import Literal
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks, peak_widths
 from Util.util import (
     fill_short_runs,
     GaitEvent,
+    Step,
     get_ankle_speed,
     get_ground_contact_stages,
     get_gait_events,
+    get_steps,
 )
 
 
@@ -53,83 +54,6 @@ def segment_pulls(pull_onsets, sample_count, fps=100, baseline_time=0.5):
         Pull(start=segment_start, end=segment_end, pull_onset=int(onset))
         for onset, segment_start, segment_end in zip(pull_onsets, segment_starts, segment_ends)
     ]
-
-
-@dataclass
-class Step:
-    """
-    A single step of one foot: the foot leaves the ground (FC) and lands again (IC).
-
-    Attributes:
-        FC: FC event, the foot leaves the ground
-        IC: IC event of the same foot, the foot lands again
-        step_length: straight-line distance (m) of the ankle between FC and IC, set by set_step_length
-        step_velocity: average ankle velocity (m/s) between FC and IC, set by set_step_velocity
-        type: corrective (the ankle moves away from the baseline position) or return (it moves back
-            toward it), set by set_type; None if a position needed for the decision is NaN
-    """
-
-    FC: GaitEvent
-    IC: GaitEvent
-    step_length: float | None = field(default=None, init=False)
-    step_velocity: float | None = field(default=None, init=False)
-    type: Literal["corrective", "return"] | None = field(default=None, init=False)
-
-    def __post_init__(self):
-        if self.FC.type != "FC" or self.IC.type != "IC":
-            raise ValueError("a step needs an FC event and an IC event")
-        if self.FC.side != self.IC.side:
-            raise ValueError("the FC and IC events of a step must belong to the same foot")
-        if self.FC.frame >= self.IC.frame:
-            raise ValueError("the FC event of a step must come before its IC event")
-
-    @property
-    def side(self) -> Literal["left", "right"]:
-        return self.FC.side
-
-    def set_step_length(self, keypoints: np.ndarray, labels: list[str]):
-        """
-        Euclidean distance between the ankle position at FC and at IC.
-
-        Args:
-            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
-                like the events
-            labels: keypoint labels, must contain "<side>_ankle"
-        """
-        ankle = keypoints[:, labels.index(f"{self.side}_ankle"), :]
-        self.step_length = float(np.linalg.norm(ankle[self.IC.frame] - ankle[self.FC.frame]))
-
-    def set_step_velocity(self, fps: float):
-        """
-        Step length divided by the step duration (FC to IC). Needs set_step_length first.
-
-        Args:
-            fps: sampling rate of the keypoints the events were detected on
-        """
-        if self.step_length is None:
-            raise ValueError("call set_step_length before set_step_velocity")
-        step_duration = (self.IC.frame - self.FC.frame) / fps
-        self.step_velocity = self.step_length / step_duration
-
-    def set_type(self, keypoints: np.ndarray, labels: list[str], baseline_position: np.ndarray):
-        """
-        Corrective if the ankle lands farther from the baseline position than where it lifted off,
-        return if it lands closer. None if the baseline or the ankle at FC or IC is NaN.
-
-        Args:
-            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
-                like the events
-            labels: keypoint labels, must contain "<side>_ankle"
-            baseline_position: (3,) reference position, e.g. Pull.baseline_ankle_position
-        """
-        ankle = keypoints[:, labels.index(f"{self.side}_ankle"), :]
-        distance_at_lift_off = np.linalg.norm(ankle[self.FC.frame] - baseline_position)
-        distance_at_landing = np.linalg.norm(ankle[self.IC.frame] - baseline_position)
-        # a NaN distance would fail the comparison and silently give "return"
-        if np.isnan(distance_at_lift_off) or np.isnan(distance_at_landing):
-            self.type = None
-        else:
-            self.type = "corrective" if distance_at_landing > distance_at_lift_off else "return"
 
 
 class Pull:
@@ -611,36 +535,3 @@ def get_trunk_vectors(keypoints: np.ndarray, labels: list[str]) -> np.ndarray:
     """trunk vector mid_hip -> mid_shoulder for every frame; (frames, 3)."""
     return keypoints[:, labels.index("mid_shoulder"), :] - keypoints[:, labels.index("mid_hip"), :]
 
-
-def get_steps(
-    gait_events: list[GaitEvent],
-    keypoints: np.ndarray,
-    labels: list[str],
-    min_step_length: float = 0.0,
-) -> list[Step]:
-    """
-    Pair each FC with the next event of the same foot if that event is an IC.
-    An FC followed by another FC (missed IC) or by nothing gives no step.
-    Every step gets its step length; steps shorter than min_step_length (shuffles) are dropped.
-
-    Args:
-        gait_events: events of the whole recording, e.g. from get_gait_events
-        keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
-        labels: keypoint labels, must contain "left_ankle" and "right_ankle"
-        min_step_length: minimum step length (m); 0 keeps all steps
-    Returns:
-        steps of both feet, sorted by FC frame
-    """
-    steps = []
-    for side in ["left", "right"]:
-        side_events = sorted(
-            (event for event in gait_events if event.side == side), key=lambda event: event.frame
-        )
-        for event, next_event in zip(side_events, side_events[1:]):
-            if event.type == "FC" and next_event.type == "IC":
-                step = Step(FC=event, IC=next_event)
-                step.set_step_length(keypoints, labels)
-                # a NaN length (missing ankle) fails the comparison, so the step is kept
-                if not step.step_length < min_step_length:
-                    steps.append(step)
-    return sorted(steps, key=lambda step: step.FC.frame)

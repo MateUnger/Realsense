@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import importlib
 from typing import Literal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 import pyrealsense2 as rs
 import pandas as pd
@@ -589,21 +589,6 @@ def subtract_mean(keypoints: np.ndarray) -> tuple:
     return centered_keypoints, mean
 
 
-def resample_keypoints(keypoints: np.ndarray, original_fps: float, target_fps: float):
-    """Resample keypoint data to desired sampling frequency.
-    Note, the DC offset removed first/centered (to avoid filter leaks), then added back.
-    Args:
-        keypoints: array (frames, keypoints, dims)
-        original_fps: sampling frequency of the input
-        target_fps: desired sampling frequency
-    Returns:
-        resampled: keypoints resampled to target_fps (with mean added back)."""
-    ratio = Fraction(str(target_fps)) / Fraction(str(original_fps))
-    centered, mean = subtract_mean(keypoints)
-    resampled = resample_poly(centered, ratio.numerator, ratio.denominator, axis=0, padtype="edge")
-    return resampled + mean
-
-
 def get_frame_times(
     filename: str, n_frames: int | None = None, startup: float = 2.0
 ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -822,97 +807,6 @@ def get_projection(plane_normal_vectors: np.ndarray, vector_array: np.ndarray):
             for plane_normal, vector in zip(plane_normal_vectors, vector_array)
         ]
     )
-
-
-# =========================================== SEGMENTATION ===========================================
-
-
-def segment_pulls(
-    keypoint: np.ndarray,
-    fps: float,
-    min_peak_velocity: float | None = None,
-    min_interval: float = 1.5,
-    onset_fraction: float = 0.1,
-    vertical_axis: int = 2,
-    max_velocity: float = 2.0,
-    min_displacement: float = 0.1,
-) -> tuple[list, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Segment a pull test into pulls, each segment running from one pull onset to the next.
-
-    Each pull is a velocity peak along the (horizontal) pull direction followed by a return, so
-    the speed has two peaks per pull while the signed velocity along the pull direction has one.
-    The pull direction is the main axis of the horizontal velocity, signed so that it points
-    away from the rest position. The onset is the last sample before a peak where the velocity
-    is below onset_fraction of the peak velocity.
-
-    Args:
-        keypoint: position of one keypoint, shape (n_frames, 3), e.g. mid_shoulder
-        fps: sampling rate in Hz
-        min_peak_velocity: minimum pull peak velocity in m/s (default: half the 99th percentile;
-            lower it if small pulls are missed)
-        min_interval: minimum time between two pulls in seconds
-        onset_fraction: onset threshold as a fraction of the peak velocity
-        vertical_axis: index of the vertical axis (excluded from the pull direction)
-        max_velocity: samples faster than this (m/s) are tracking errors and ignored
-        min_displacement: minimum displacement (m) along the pull direction for a pull
-    Returns:
-        segments: list of (start, end) frame indices (end exclusive), the last one ends at the
-            end of the recording
-        onsets: frame index of each pull onset
-        peaks: frame index of each pull velocity peak
-        direction: unit vector of the pull direction
-    """
-    velocity = np.gradient(keypoint, 1 / fps, axis=0)
-    horizontal = [dim for dim in range(keypoint.shape[1]) if dim != vertical_axis]
-    velocity_horizontal = velocity[:, horizontal]
-    valid = np.all(np.isfinite(velocity_horizontal), axis=1)
-    valid[valid] = np.linalg.norm(velocity_horizontal[valid], axis=1) <= max_velocity
-
-    # main direction of the horizontal motion
-    centered = velocity_horizontal[valid] - velocity_horizontal[valid].mean(axis=0)
-    _, _, components = np.linalg.svd(centered, full_matrices=False)
-    direction = np.zeros(keypoint.shape[1])
-    direction[horizontal] = components[0]
-    velocity_pull = np.where(valid, np.nan_to_num(velocity_horizontal) @ components[0], 0)
-
-    # the subject stands at rest most of the time and is displaced briefly by each pull, so the
-    # position along the pull direction is skewed towards the pull (clipped: robust to tracking errors)
-    position_pull = keypoint[:, horizontal] @ components[0]
-    position_pull = position_pull[valid & np.isfinite(position_pull)]
-    clipped = np.clip(position_pull, *np.percentile(position_pull, [1, 99]))
-    if np.mean((clipped - clipped.mean()) ** 3) < 0:
-        direction, velocity_pull = -direction, -velocity_pull
-
-    if min_peak_velocity is None:
-        min_peak_velocity = 0.5 * np.percentile(velocity_pull, 99)
-    peaks, _ = find_peaks(velocity_pull, height=min_peak_velocity, distance=int(min_interval * fps))
-
-    # a pull has to move the keypoint away from where the velocity peak started
-    position = np.where(valid, keypoint @ direction, np.nan)
-    peaks = np.array(
-        [
-            peak
-            for peak, next_peak in zip(peaks, np.append(peaks[1:], len(keypoint)))
-            if np.nanmax(position[peak:next_peak], initial=-np.inf)
-            - np.nanmin(position[max(0, peak - int(min_interval * fps)) : peak + 1], initial=np.inf)
-            >= min_displacement
-        ],
-        dtype=int,
-    )
-
-    onsets = []
-    previous_peak = 0
-    for peak in peaks:
-        below = np.flatnonzero(
-            velocity_pull[previous_peak:peak] <= onset_fraction * velocity_pull[peak]
-        )
-        onsets.append(previous_peak + below[-1] if below.size else previous_peak)
-        previous_peak = peak
-    onsets = np.array(onsets, dtype=int)
-
-    segments = list(zip(onsets, np.append(onsets[1:], len(keypoint))))
-    return segments, onsets, peaks, direction
 
 
 # =========================================== CALIBRATION ===========================================
@@ -1407,6 +1301,117 @@ def get_gait_events_two_stage(
         show_debug_figure=show_debug_figure,
     )
     return gait_events, speed_threshold
+
+
+@dataclass
+class Step:
+    """
+    A single step of one foot: the foot leaves the ground (FC) and lands again (IC).
+
+    Attributes:
+        FC: FC event, the foot leaves the ground
+        IC: IC event of the same foot, the foot lands again
+        step_length: straight-line distance (m) of the ankle between FC and IC, set by set_step_length
+        step_velocity: average ankle velocity (m/s) between FC and IC, set by set_step_velocity
+        type: corrective (the ankle moves away from the baseline position) or return (it moves back
+            toward it), set by set_type; None if a position needed for the decision is NaN
+    """
+
+    FC: GaitEvent
+    IC: GaitEvent
+    step_length: float | None = field(default=None, init=False)
+    step_velocity: float | None = field(default=None, init=False)
+    type: Literal["corrective", "return"] | None = field(default=None, init=False)
+
+    def __post_init__(self):
+        if self.FC.type != "FC" or self.IC.type != "IC":
+            raise ValueError("a step needs an FC event and an IC event")
+        if self.FC.side != self.IC.side:
+            raise ValueError("the FC and IC events of a step must belong to the same foot")
+        if self.FC.frame >= self.IC.frame:
+            raise ValueError("the FC event of a step must come before its IC event")
+
+    @property
+    def side(self) -> Literal["left", "right"]:
+        return self.FC.side
+
+    def set_step_length(self, keypoints: np.ndarray, labels: list[str]):
+        """
+        Euclidean distance between the ankle position at FC and at IC.
+
+        Args:
+            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+                like the events
+            labels: keypoint labels, must contain "<side>_ankle"
+        """
+        ankle = keypoints[:, labels.index(f"{self.side}_ankle"), :]
+        self.step_length = float(np.linalg.norm(ankle[self.IC.frame] - ankle[self.FC.frame]))
+
+    def set_step_velocity(self, fps: float):
+        """
+        Step length divided by the step duration (FC to IC). Needs set_step_length first.
+
+        Args:
+            fps: sampling rate of the keypoints the events were detected on
+        """
+        if self.step_length is None:
+            raise ValueError("call set_step_length before set_step_velocity")
+        step_duration = (self.IC.frame - self.FC.frame) / fps
+        self.step_velocity = self.step_length / step_duration
+
+    def set_type(self, keypoints: np.ndarray, labels: list[str], baseline_position: np.ndarray):
+        """
+        Corrective if the ankle lands farther from the baseline position than where it lifted off,
+        return if it lands closer. None if the baseline or the ankle at FC or IC is NaN.
+
+        Args:
+            keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+                like the events
+            labels: keypoint labels, must contain "<side>_ankle"
+            baseline_position: (3,) reference position, e.g. Pull.baseline_ankle_position
+        """
+        ankle = keypoints[:, labels.index(f"{self.side}_ankle"), :]
+        distance_at_lift_off = np.linalg.norm(ankle[self.FC.frame] - baseline_position)
+        distance_at_landing = np.linalg.norm(ankle[self.IC.frame] - baseline_position)
+        # a NaN distance would fail the comparison and silently give "return"
+        if np.isnan(distance_at_lift_off) or np.isnan(distance_at_landing):
+            self.type = None
+        else:
+            self.type = "corrective" if distance_at_landing > distance_at_lift_off else "return"
+
+
+def get_steps(
+    gait_events: list[GaitEvent],
+    keypoints: np.ndarray,
+    labels: list[str],
+    min_step_length: float = 0.0,
+) -> list[Step]:
+    """
+    Pair each FC with the next event of the same foot if that event is an IC.
+    An FC followed by another FC (missed IC) or by nothing gives no step.
+    Every step gets its step length; steps shorter than min_step_length (shuffles) are dropped.
+
+    Args:
+        gait_events: events of the whole recording, e.g. from get_gait_events
+        keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+        labels: keypoint labels, must contain "left_ankle" and "right_ankle"
+        min_step_length: minimum step length (m); 0 keeps all steps
+    Returns:
+        steps of both feet, sorted by FC frame
+    """
+    steps = []
+    for side in ["left", "right"]:
+        side_events = sorted(
+            (event for event in gait_events if event.side == side), key=lambda event: event.frame
+        )
+        for event, next_event in zip(side_events, side_events[1:]):
+            if event.type == "FC" and next_event.type == "IC":
+                step = Step(FC=event, IC=next_event)
+                step.set_step_length(keypoints, labels)
+                # a NaN length (missing ankle) fails the comparison, so the step is kept
+                if not step.step_length < min_step_length:
+                    steps.append(step)
+    return sorted(steps, key=lambda step: step.FC.frame)
 
 
 def plot_gait_event_debug_figure(
