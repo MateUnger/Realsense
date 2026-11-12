@@ -84,8 +84,8 @@
 
 1. center of mass movement
 2. center of mass frequency analysis
-3. body sway - trunk bending (does direction matter? <mark>TODO:</mark> ask Julian )
+3. body sway - trunk bending (does direction matter?, bending compared to baseline or lower body? <mark>TODO:</mark> ask Julian )
 4. arm ROM (compensation)
 5. number of steps taken
-6. step parameters (length, duration, direction)
+6. step parameters (length, velocity, direction(?))
 7. number of times bending angle crosses threshold? <mark> TODO:</mark> look it up
