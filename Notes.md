@@ -83,10 +83,11 @@
 15. performing 2 types of movement (turning and sitting down) at the same time? (overlapping segments)
 
 ## Balancing
-
+<mark>TODO: check which parameters are still missing</mark>
 1. center of mass movement (statokinesigram, stabilogram)
-2. center of mass frequency analysis (FFT, PSD)
-3. body sway - trunk bending (does direction matter?, bending compared to baseline or lower body? <mark>TODO:</mark> ask Julian )
-4. arm ROM (compensation)
-(5.) number of steps taken
-(6.) step parameters (length, velocity, direction(?))
+2. total sway path (com movement in 2D)
+3. center of mass frequency analysis (PSD, F50, F80, peak)
+4. body sway - trunk bending (does direction matter?, bending compared to baseline or lower body? <mark>TODO:</mark> ask Julian )
+5. arm ROM (compensation)
+6. (?) number of steps taken
+7. (?) step parameters (length, velocity, direction(?))
