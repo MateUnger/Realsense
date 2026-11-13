@@ -577,18 +577,6 @@ def filter_keypoints_stereo(
     return keypoints_filtered
 
 
-def subtract_mean(keypoints: np.ndarray) -> tuple:
-    """Subtract the mean (over time) from every keypoint for each dimention.
-    Args:
-        keypoints: array shaped (frames, keypoints, dims)
-    Returns:
-        centered: keypoints centered around their mean over time
-        mean: (1, keypoints, dims) used for centering"""
-    mean = np.nanmean(keypoints, axis=0, keepdims=True)
-    centered_keypoints = keypoints - mean
-    return centered_keypoints, mean
-
-
 def get_frame_times(
     filename: str, n_frames: int | None = None, startup: float = 2.0
 ) -> tuple[np.ndarray, np.ndarray, float]:

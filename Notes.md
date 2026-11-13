@@ -2,7 +2,7 @@
 
 ## general
 - <mark>TODO:</mark> move PC closer to camera setup OR get really long USB 3.2 cable for stereo
-- <mark>TODO:</mark> need foam pad
+- <mark>TODO:</mark> need foam pad, use the one in Thomas' room with a piece of wook on top
 
 ---
 
@@ -67,7 +67,7 @@
     6. stride velocity
     7. max trunk bending angle
 
-- turning (are both treated the same? <mark>TODO:</mark> ask Julian)
+- turning (2x)
 
     8. duration
     9. step count
@@ -80,12 +80,13 @@
     13. trunk bending max angular velocity
     14. max velocity (mid_shoulder)
 
+15. performing 2 types of movement (turning and sitting down) at the same time? (overlapping segments)
+
 ## Balancing
 
-1. center of mass movement
-2. center of mass frequency analysis
+1. center of mass movement (statokinesigram, stabilogram)
+2. center of mass frequency analysis (FFT, PSD)
 3. body sway - trunk bending (does direction matter?, bending compared to baseline or lower body? <mark>TODO:</mark> ask Julian )
 4. arm ROM (compensation)
-5. number of steps taken
-6. step parameters (length, velocity, direction(?))
-7. number of times bending angle crosses threshold? <mark> TODO:</mark> look it up
+(5.) number of steps taken
+(6.) step parameters (length, velocity, direction(?))
