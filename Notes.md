@@ -1,8 +1,22 @@
 # Validation study
 
 ## general
-- <mark>TODO:</mark> move PC closer to camera setup OR get really long USB 3.2 cable for stereo
-- <mark>TODO:</mark> need foam pad, use the one in Thomas' room with a piece of wook on top
+- <mark>TODO:</mark> need iPad, test sync
+- <mark>TODO:</mark> learn how to do Pull test
+
+iPad sync
+- start qtm
+- settings, ble medscribe, connected when no lights are on
+- start bridge script 
+
+## marker positions
+![lower body front](Util/qualisys_marker_positions/lower_body_front.png)
+![lower body back](Util/qualisys_marker_positions/lower_body_back.png)
+![lower body side](Util/qualisys_marker_positions/lower_body_side.png)
+
+![upper body front](Util/qualisys_marker_positions/upper_body_front.png)
+![upper body back](Util/qualisys_marker_positions/upper_body_back.png)
+![upper body side](Util/qualisys_marker_positions/upper_body_side.png)
 
 ---
 
@@ -14,10 +28,9 @@
 
 ## Pull test
 - stand at close mark | pull | go back to mark |
-- have to get someone to perform them (? - Andreas, Julian, someone else)
 
 ## Timed-up-and-go
-- standing baseline (2s) | sitting baseline (2s) | stand up | walk to mark | turn around mark | walk back | turn around | sit down | sitting baseline (2s)
+- standing baseline (2s) | sitting baseline (2s) | stand up | walk | turn  | walk | turn | sit down | sitting baseline (2s)
 
 - no walking aid
 - no armrests on chair
@@ -26,7 +39,7 @@
 
 ## Balancing
 - normal floor eyes open baseline (2s) | foam eyes open baseline (2s) | foam eyes closed
-- standing on foam (? - )
+- standing on foam
 - parameters are not well established, mostly goes by eye
 - baseline with eyes open, then eyes closed (?)
 

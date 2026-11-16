@@ -1,16 +1,14 @@
 # ingore folders
 realsense_env/
-
+data/
 
 #ignore file types
 *.db3
 *.npy
 *.avi
 *.mp4
-*.raw
 *.json
 *.bin
-*.png
 *.pyc
 *.mkv
 *.tsv
