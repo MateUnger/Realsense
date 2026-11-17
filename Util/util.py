@@ -459,6 +459,69 @@ def fill_short_runs(binary_signal: np.ndarray, value: int, min_length: int) -> n
     return filled_signal
 
 
+def merge_short_runs(binary_signal: np.ndarray, min_lengths: dict[int, int]) -> np.ndarray:
+    """
+    Repeatedly flip the shortest run that is shorter than its minimum length, until no such run
+    is left. Unlike calling fill_short_runs for 0s and then for 1s, a brief noise spike inside a
+    long run is always flipped before the run around it, so the long run is kept whole.
+    Runs touching the start or end of the signal are kept, since their real length is unknown.
+
+    Args:
+        binary_signal: array of 0s and 1s
+        min_lengths: minimum run length in samples for each value, e.g. {0: 30, 1: 30}
+    Returns:
+        copy of the signal with the short runs flipped
+    """
+    merged_signal = binary_signal.copy()
+    while True:
+        change_indices = np.flatnonzero(np.diff(merged_signal)) + 1
+        run_starts = np.concatenate([[0], change_indices])
+        run_ends = np.concatenate([change_indices, [len(merged_signal)]])
+        short_runs = [
+            (run_end - run_start, run_start, run_end)
+            for run_start, run_end in zip(run_starts, run_ends)
+            if run_start > 0
+            and run_end < len(merged_signal)
+            and run_end - run_start < min_lengths[int(merged_signal[run_start])]
+        ]
+        if not short_runs:
+            return merged_signal
+        _, run_start, run_end = min(short_runs)
+        merged_signal[run_start:run_end] = 1 - merged_signal[run_start]
+
+
+def get_keypoint_position_mask(
+    keypoint: np.ndarray,
+    baseline_end: float,
+    direction: str,
+    min_state_length: float,
+    threshold: float,
+    max_percentile: int,
+):
+    """
+    Normalizes 1D keypoint coords, creates a mask indicating the position being close to the max (up, side) or min (down) of the whole recording.
+    Assumes the coordinate rises after the baseline.
+    """
+    position = keypoint
+    position_baseline = np.nanmean(position[: int(baseline_end)])
+    position_baseline_diff = position - position_baseline
+    position_normalized = position_baseline_diff / np.nanpercentile(
+        position_baseline_diff, max_percentile
+    )
+
+    match direction:
+        case "up":
+            mask = position_normalized > 1 - threshold
+            mask = fill_short_runs(mask, value=0, min_length=min_state_length)
+        case "down" | "side":
+            mask = position_normalized < threshold
+            mask = fill_short_runs(mask, value=1, min_length=min_state_length)
+            mask = fill_short_runs(mask, value=0, min_length=min_state_length)
+
+    # mask = fill_short_runs(mask, value=1, min_length=min_state_length)
+    return mask, position_normalized
+
+
 def filter_keypoints_median_butter(
     keypoints: np.ndarray,
     sampling_rate: float,
@@ -1091,8 +1154,6 @@ class GaitEvent:
         side: foot (left/right) the event belongs to
         perspective: perspective (front/back) of segment to which the event belong to
         segment: indicates whether the segment contains straight walking or turning action
-        segment_index: index of segment (starting from 0 at the beginning of recording). Incremented with perspective change
-        relative_position: position of the event within the segment, relative to the segment's end (1=segment start in time, 0=segment end)
     """
 
     type: Literal["IC", "FC"]
@@ -1100,27 +1161,20 @@ class GaitEvent:
     side: Literal["left", "right"]
     perspective: Literal["front", "back"] | None = None
     segment: Literal["straight", "turn"] | None = None
-    segment_index: int | None = None
-    relative_position: float | None = None
 
     def __str__(self):
         # one table row; str() so that None fields can be padded
-        fields = [
-            self.type,
-            self.side,
-            self.frame,
-            self.perspective,
-            self.segment,
-            self.segment_index,
-            self.relative_position,
-        ]
+        fields = [self.type, self.side, self.frame, self.perspective, self.segment]
         return "".join(f"{str(field):<10}" for field in fields)
 
 
 def get_ankle_speed(keypoints: np.ndarray, labels: list[str], side: str, fps: float) -> np.ndarray:
-    """3D speed (m/s) of the "<side>_ankle" keypoint, from frame-to-frame differences; (frames,)."""
+    """3D speed (m/s) of the "<side>_ankle" keypoint, from central differences; (frames,)."""
     ankle = keypoints[:, labels.index(f"{side}_ankle"), :]
-    return np.linalg.norm(np.diff(ankle, axis=0, prepend=ankle[[0]]), axis=1) * fps
+    ankle_speed = np.linalg.norm(np.gradient(ankle, axis=0), axis=1) * fps
+    # gradient skips the centre sample, so a 1-frame gap would get a speed: keep NaN positions NaN
+    ankle_speed[np.isnan(ankle).any(axis=1)] = np.nan
+    return ankle_speed
 
 
 def get_ground_contact_stages(
@@ -1134,7 +1188,8 @@ def get_ground_contact_stages(
     """
     Ground contact signal (1 = on the ground) after each cleaning stage, in order:
     "raw" (speed below threshold), "masked" (on the ground outside event_mask),
-    "no short swings", "no short contacts". The last one is the final result.
+    "no short runs" (swing and stance periods that are too short merged into their neighbours,
+    shortest first, see merge_short_runs). The last one is the final result.
     """
     ground_contact_raw = (ankle_speed < speed_threshold).astype(int)
     # outside the mask the foot is treated as on the ground, so no events are created there
@@ -1142,17 +1197,14 @@ def get_ground_contact_stages(
         ground_contact_masked = ground_contact_raw
     else:
         ground_contact_masked = np.where(event_mask, ground_contact_raw, 1)
-    ground_contact_no_short_swing = fill_short_runs(
-        ground_contact_masked, value=0, min_length=round(min_swing_time * fps)
-    )
-    ground_contact_no_short_contact = fill_short_runs(
-        ground_contact_no_short_swing, value=1, min_length=round(min_stance_time * fps)
+    ground_contact_no_short_runs = merge_short_runs(
+        ground_contact_masked,
+        min_lengths={0: round(min_swing_time * fps), 1: round(min_stance_time * fps)},
     )
     return {
         "raw": ground_contact_raw,
         "masked": ground_contact_masked,
-        "no short swings": ground_contact_no_short_swing,
-        "no short contacts": ground_contact_no_short_contact,
+        "no short runs": ground_contact_no_short_runs,
     }
 
 
@@ -1189,11 +1241,17 @@ def get_gait_events(
         stages = get_ground_contact_stages(
             ankle_speed, fps, speed_threshold, min_swing_time, min_stance_time, event_mask
         )
-        ground_contact = stages["no short contacts"]
+        ground_contact = stages["no short runs"]
 
         contact_changes = np.diff(ground_contact, prepend=ground_contact[0])
         initial_contact_frames = np.flatnonzero(contact_changes == 1)
         final_contact_frames = np.flatnonzero(contact_changes == -1)
+
+        # NaN speed reads as swing (NaN < threshold is False): drop events on the edges of NaN gaps
+        nan_speed = np.isnan(ankle_speed)
+        gap_edge = nan_speed | np.concatenate(([False], nan_speed[:-1]))
+        initial_contact_frames = initial_contact_frames[~gap_edge[initial_contact_frames]]
+        final_contact_frames = final_contact_frames[~gap_edge[final_contact_frames]]
 
         all_events += [
             GaitEvent(type="IC", frame=int(frame), side=side) for frame in initial_contact_frames

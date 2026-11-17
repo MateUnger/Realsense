@@ -30,7 +30,7 @@ iPad sync
 - stand at close mark | pull | go back to mark |
 
 ## Timed-up-and-go
-- standing baseline (2s) | sitting baseline (2s) | stand up | walk | turn  | walk | turn | sit down | sitting baseline (2s)
+- (standing baseline (2s)) | sitting baseline (2s) | stand up | walk | turn  | walk | turn | sit down |
 
 - no walking aid
 - no armrests on chair
@@ -93,14 +93,14 @@ iPad sync
     13. trunk bending max angular velocity
     14. max velocity (mid_shoulder)
 
-15. performing 2 types of movement (turning and sitting down) at the same time? (overlapping segments)
+15. performing 2 types of movement (turning and sitting down) at the same time? (overlapping segments<mark>TODO:there is a thershold, maybe half erect height</mark>)
 
 ## Balancing
 <mark>TODO: check which parameters are still missing</mark>
 1. center of mass movement (statokinesigram, stabilogram)
 2. total sway path (com movement in 2D)
 3. center of mass frequency analysis (PSD, F50, F80, peak)
-4. body sway - trunk bending (does direction matter?, bending compared to baseline or lower body? <mark>TODO:</mark> ask Julian )
+4. trunk bending (direction matters - affected side should be more common, bending compared to baseline or lower body?<mark>TODO:</mark>)
 5. arm ROM (compensation)
 6. (?) number of steps taken
 7. (?) step parameters (length, velocity, direction(?))

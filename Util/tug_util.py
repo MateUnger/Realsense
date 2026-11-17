@@ -8,39 +8,9 @@ from Util.util import (
     GaitEvent,
     get_gait_events_two_stage,
     get_ankle_speed,
+    get_keypoint_position_mask,
 )
-
-
-def get_keypoint_position_mask(
-    keypoint: np.ndarray,
-    baseline_end: float,
-    direction: str,
-    min_state_length: float,
-    threshold: float,
-    max_percentile: int,
-):
-    """
-    Normalizes 1D keypoint coords, creates a mask indicating the position being close to the max (up, side) or min (down) of the whole recording.
-    Assumes the coordinate rises after the baseline.
-    """
-    position = keypoint
-    position_baseline = np.nanmean(position[: int(baseline_end)])
-    position_baseline_diff = position - position_baseline
-    position_normalized = position_baseline_diff / np.nanpercentile(
-        position_baseline_diff, max_percentile
-    )
-
-    match direction:
-        case "up":
-            mask = position_normalized > 1 - threshold
-            mask = fill_short_runs(mask, value=0, min_length=min_state_length)
-        case "down" | "side":
-            mask = position_normalized < threshold
-            mask = fill_short_runs(mask, value=1, min_length=min_state_length)
-            mask = fill_short_runs(mask, value=0, min_length=min_state_length)
-
-    # mask = fill_short_runs(mask, value=1, min_length=min_state_length)
-    return mask, position_normalized
+from Util.gait_util import GaitCycle, get_gait_cycles
 
 
 def get_trunk_angle_and_movement_mask(
@@ -78,16 +48,14 @@ def get_trunk_angle_and_movement_mask(
 
 def get_step_and_stride_parameters(
     gait_events: list[GaitEvent],
-    keypoints: np.ndarray,
-    labels: list,
-    fps: float,
+    gait_cycles: list[GaitCycle],
     start: int,
     end: int,
 ):
     """
     Steps and strides between frames start and end. A step is an initial contact (IC) inside
-    the range. A stride goes from one IC to the next IC of the same foot, both inside the range
-    (same as GaitCycle in gait_util: time between the ICs, 3D ankle displacement between them).
+    the range. A stride is a valid gait cycle (see get_gait_cycles and GaitCycle.valid in
+    gait_util) whose IC0 and IC2 are both inside the range.
 
     Returns:
         number of steps, mean stride time (s), mean stride length (m), mean stride velocity (m/s);
@@ -96,23 +64,19 @@ def get_step_and_stride_parameters(
     initial_contacts = [
         event for event in gait_events if event.type == "IC" and start <= event.frame < end
     ]
-    stride_times = []
-    stride_lengths = []
-    for side in ["left", "right"]:
-        side_frames = sorted(event.frame for event in initial_contacts if event.side == side)
-        ankle = keypoints[:, labels.index(f"{side}_ankle"), :]
-        for stride_start, stride_end in zip(side_frames, side_frames[1:]):
-            stride_times.append((stride_end - stride_start) / fps)
-            stride_lengths.append(np.linalg.norm(ankle[stride_end] - ankle[stride_start]))
+    strides = [
+        gait_cycle
+        for gait_cycle in gait_cycles
+        if gait_cycle.valid and start <= gait_cycle.IC0.frame and gait_cycle.IC2.frame < end
+    ]
 
-    if not stride_times:
+    if not strides:
         return len(initial_contacts), np.nan, np.nan, np.nan
-    stride_velocities = np.array(stride_lengths) / np.array(stride_times)
     return (
         len(initial_contacts),
-        np.mean(stride_times),
-        np.nanmean(stride_lengths),
-        np.nanmean(stride_velocities),
+        np.mean([stride.parameters.stride_time for stride in strides]),
+        np.nanmean([stride.parameters.stride_length for stride in strides]),
+        np.nanmean([stride.parameters.stride_velocity for stride in strides]),
     )
 
 
@@ -309,10 +273,8 @@ class TimedUpAndGo:
     def set_walking_parameters(
         self,
         gait_events: list[GaitEvent],
-        keypoints: np.ndarray,
-        labels: list,
+        gait_cycles: list[GaitCycle],
         trunk_angles: np.ndarray,
-        fps: float,
     ):
         """
         Number of steps, mean stride time, length and velocity, and max trunk angle of the
@@ -320,10 +282,8 @@ class TimedUpAndGo:
 
         Args:
             gait_events: gait events of the whole recording
-            keypoints: keypoint data of the whole recording (n_frames, n_kpts, n_dims)
-            labels: labels for the keypoints
+            gait_cycles: gait cycles of the whole recording, see get_gait_cycles in gait_util
             trunk_angles: trunk angle (degrees) relative to the sitting baseline, whole recording
-            fps: sampling rate in Hz
         """
         if self.walk_out_start is not None:
             (
@@ -332,7 +292,7 @@ class TimedUpAndGo:
                 self.walk_out_stride_length,
                 self.walk_out_stride_velocity,
             ) = get_step_and_stride_parameters(
-                gait_events, keypoints, labels, fps, self.walk_out_start, self.walk_out_end
+                gait_events, gait_cycles, self.walk_out_start, self.walk_out_end
             )
             self.walk_out_max_trunk_angle = np.nanmax(
                 trunk_angles[self.walk_out_start : self.walk_out_end]
@@ -344,7 +304,7 @@ class TimedUpAndGo:
                 self.walk_back_stride_length,
                 self.walk_back_stride_velocity,
             ) = get_step_and_stride_parameters(
-                gait_events, keypoints, labels, fps, self.walk_back_start, self.walk_back_end
+                gait_events, gait_cycles, self.walk_back_start, self.walk_back_end
             )
             self.walk_back_max_trunk_angle = np.nanmax(
                 trunk_angles[self.walk_back_start : self.walk_back_end]
@@ -367,7 +327,7 @@ TURN_THR = 0.15
 MIN_TURN_DURATION = 0.5  # seconds
 ANKLE_THR = 0.8  # multiplier of the velocity, gives the ankle speed threshold
 INITIAL_STEP_SPEED_THR = 1.0  # m/s, velocity of the first gait event detection
-MAX_STRIDE_TIME = 2.0  # seconds, longer IC -> IC intervals are not initial gait cycles
+MAX_STRIDE_TIME = 2.0  # seconds, longer IC -> IC intervals are not gait cycles
 MIN_SWING_TIME = 0.3  # seconds
 MIN_STANCE_TIME = 0.3  # seconds
 
@@ -386,6 +346,7 @@ class TimedUpAndGoRecording:
         # ankle speed threshold of the final gait event detection (m/s):
         # ANKLE_THR * mean stride velocity of the initial gait cycles
         self.step_speed_threshold = np.nan
+        self.gait_cycles: list[GaitCycle] = []
         self.tugs: list[TimedUpAndGo] = []
 
     def segment_tugs(self):
@@ -462,6 +423,12 @@ class TimedUpAndGoRecording:
             min_swing_time=MIN_SWING_TIME,
             min_stance_time=MIN_STANCE_TIME,
         )
+        # events are detected inside turns too (turn steps), so mark them for GaitCycle.valid
+        for event in self.gait_events:
+            event.segment = "turn" if self.turn_mask[event.frame] else "straight"
+        self.gait_cycles = get_gait_cycles(
+            self.gait_events, self.keypoints, self.labels, self.fps, MAX_STRIDE_TIME
+        )
         for tug in self.tugs:
             tug.set_sit_stand_phases(self.sit_mask, self.stand_mask, self.fps)
             tug.set_trunk_bending(self.trunk_angles, self.fps)
@@ -469,9 +436,7 @@ class TimedUpAndGoRecording:
             tug.set_turn_phases(self.turn_mask, self.fps)
             tug.set_turn_steps(self.gait_events)
             tug.set_walking_phases(self.fps)
-            tug.set_walking_parameters(
-                self.gait_events, self.keypoints, self.labels, self.trunk_angles, self.fps
-            )
+            tug.set_walking_parameters(self.gait_events, self.gait_cycles, self.trunk_angles)
 
     def plot(self):
         """
