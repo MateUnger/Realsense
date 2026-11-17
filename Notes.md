@@ -3,6 +3,7 @@
 ## general
 - <mark>TODO:</mark> need iPad, test sync
 - <mark>TODO:</mark> learn how to do Pull test
+- <mark>TODO:</mark> uniform clothing? 
 
 iPad sync
 - start qtm
@@ -81,6 +82,7 @@ iPad sync
     7. max trunk bending angle
 
 - turning (2x)
+    - turning phase cant start mid swing, the last step in the straight phase can be the first starting step in the tunr phase
 
     8. duration
     9. step count
@@ -88,19 +90,22 @@ iPad sync
 
 - standing up / sitting down
 
-    11. duration (first movement -> standing still, standing -> sitting still?) <mark>TODO:</mark> ask Julian
+    11. duration (first movement -> standing up (hips & knees at x% of erect vertical height), standing -> sitting still)
     12. trunk bending max angle
     13. trunk bending max angular velocity
     14. max velocity (mid_shoulder)
 
-15. performing 2 types of movement (turning and sitting down) at the same time? (overlapping segments<mark>TODO:there is a thershold, maybe half erect height</mark>)
+15. performing 2 types of movement (turning and sitting down) at the same time? (overlapping segments, no threshold, make one up)
 
 ## Balancing
-<mark>TODO: check which parameters are still missing</mark>
+
 1. center of mass movement (statokinesigram, stabilogram)
 2. total sway path (com movement in 2D)
 3. center of mass frequency analysis (PSD, F50, F80, peak)
-4. trunk bending (direction matters - affected side should be more common, bending compared to baseline or lower body?<mark>TODO:</mark>)
+4. trunk bending (direction matters - affected side should be more common, bending compared to baseline, lower body or global vertical axis?<mark>TODO:</mark>)
 5. arm ROM (compensation)
+6. ankle joint movement (both?, mean? look it up in literature), range of motion in horizontal axes, spectral analysis maybe
+7. knee joint movement
+8. hip joint movement 
 6. (?) number of steps taken
 7. (?) step parameters (length, velocity, direction(?))

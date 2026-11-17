@@ -6,11 +6,13 @@ from Util.util import (
     angle_between_vectors,
     fill_short_runs,
     GaitEvent,
-    get_gait_events_two_stage,
+    estimate_speed_threshold,
+    get_gait_events,
     get_ankle_speed,
     get_keypoint_position_mask,
+    GaitCycle,
+    get_gait_cycles,
 )
-from Util.gait_util import GaitCycle, get_gait_cycles
 
 
 def get_trunk_angle_and_movement_mask(
@@ -55,7 +57,7 @@ def get_step_and_stride_parameters(
     """
     Steps and strides between frames start and end. A step is an initial contact (IC) inside
     the range. A stride is a valid gait cycle (see get_gait_cycles and GaitCycle.valid in
-    gait_util) whose IC0 and IC2 are both inside the range.
+    util) whose IC0 and IC2 are both inside the range.
 
     Returns:
         number of steps, mean stride time (s), mean stride length (m), mean stride velocity (m/s);
@@ -282,7 +284,7 @@ class TimedUpAndGo:
 
         Args:
             gait_events: gait events of the whole recording
-            gait_cycles: gait cycles of the whole recording, see get_gait_cycles in gait_util
+            gait_cycles: gait cycles of the whole recording, see get_gait_cycles in util
             trunk_angles: trunk angle (degrees) relative to the sitting baseline, whole recording
         """
         if self.walk_out_start is not None:
@@ -413,13 +415,23 @@ class TimedUpAndGoRecording:
                 segment_borders, segment_borders[1:]
             )
         ]
-        self.gait_events, self.step_speed_threshold = get_gait_events_two_stage(
+        self.step_speed_threshold = estimate_speed_threshold(
             self.keypoints,
             self.labels,
             fps=self.fps,
             ankle_thr=ANKLE_THR,
             initial_speed_threshold=INITIAL_STEP_SPEED_THR,
             max_stride_time=MAX_STRIDE_TIME,
+            min_swing_time=MIN_SWING_TIME,
+            min_stance_time=MIN_STANCE_TIME,
+            event_mask=~self.turn_mask,  # walking speed from straight strides only
+        )
+        # no mask here: steps inside the turns are needed for the turn step counts
+        self.gait_events = get_gait_events(
+            self.keypoints,
+            self.labels,
+            fps=self.fps,
+            speed_threshold=self.step_speed_threshold,
             min_swing_time=MIN_SWING_TIME,
             min_stance_time=MIN_STANCE_TIME,
         )

@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import importlib
 from typing import Literal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, make_dataclass
 import matplotlib.pyplot as plt
 import pyrealsense2 as rs
 import pandas as pd
@@ -1268,7 +1268,7 @@ def get_gait_events(
     return sorted(all_events, key=lambda event: event.frame)
 
 
-def get_gait_events_two_stage(
+def estimate_speed_threshold(
     keypoints: np.ndarray,
     labels: list[str],
     fps: float,
@@ -1278,30 +1278,29 @@ def get_gait_events_two_stage(
     min_swing_time: float,
     min_stance_time: float,
     event_mask: np.ndarray | None = None,
-    show_debug_figure: bool = False,
-) -> tuple[list[GaitEvent], float]:
+) -> float:
     """
-    Two-stage gait event detection:
+    Ankle speed threshold for get_gait_events, scaled to the walking speed of the recording:
     1. gait events with ankle_thr * initial_speed_threshold as the ankle speed threshold
-    2. initial gait cycles from these events: from one IC to the next IC of the same foot, if it
-       comes within max_stride_time. Stride velocity of a cycle = 3D ankle displacement between
-       the two ICs / time between them
-    3. gait events again, with ankle_thr * mean stride velocity of the initial cycles as the
-       threshold
+    2. initial strides from these events: from one IC to the next IC of the same foot, if it
+       comes within max_stride_time. Stride velocity = 3D ankle displacement between the two
+       ICs / time between them
+    3. threshold = ankle_thr * mean stride velocity of the initial strides
 
     Args:
         keypoints: (frames, keypoints, 3) positions in meters
         labels: keypoint labels, must contain "left_ankle" and "right_ankle"
         fps: sampling rate of the positions
-        ankle_thr: multiplier of the velocity, gives the ankle speed threshold in both stages
-            (same as heel_thr in gait_util.GaitRecording)
-        initial_speed_threshold: velocity (m/s) of the first stage
-        max_stride_time: longer IC -> IC intervals (s) are not used as initial gait cycles
+        ankle_thr: multiplier of the velocity, gives the ankle speed threshold
+        initial_speed_threshold: velocity (m/s) used for the initial gait events
+        max_stride_time: longer IC -> IC intervals (s) are not used as initial strides
             (e.g. sitting or standing still between two steps)
-        min_swing_time, min_stance_time, event_mask: passed to get_gait_events
-        show_debug_figure: if True, the debug figures of the second stage are shown
+        min_swing_time, min_stance_time: passed to get_gait_events
+        event_mask: (frames,) bool, True on straight walking; passed to get_gait_events, and
+            initial strides with any frame outside it (e.g. across a turn) are not used.
+            None = everywhere
     Returns:
-        gait events of the second stage, ankle speed threshold (m/s) used in the second stage
+        ankle speed threshold (m/s)
     """
     initial_gait_events = get_gait_events(
         keypoints,
@@ -1325,6 +1324,9 @@ def get_gait_events_two_stage(
             stride_time = (stride_end - stride_start) / fps
             if stride_time > max_stride_time:
                 continue
+            # only strides on straight walking
+            if event_mask is not None and not np.all(event_mask[stride_start : stride_end + 1]):
+                continue
             stride_length = np.linalg.norm(ankle[stride_end] - ankle[stride_start])
             initial_stride_velocities.append(stride_length / stride_time)
 
@@ -1334,19 +1336,7 @@ def get_gait_events_two_stage(
             f"and max_stride_time={max_stride_time} s"
         )
     mean_stride_velocity = np.nanmean(initial_stride_velocities)
-    speed_threshold = ankle_thr * mean_stride_velocity
-
-    gait_events = get_gait_events(
-        keypoints,
-        labels,
-        fps=fps,
-        speed_threshold=speed_threshold,
-        min_swing_time=min_swing_time,
-        min_stance_time=min_stance_time,
-        event_mask=event_mask,
-        show_debug_figure=show_debug_figure,
-    )
-    return gait_events, speed_threshold
+    return ankle_thr * mean_stride_velocity
 
 
 @dataclass
@@ -1458,6 +1448,431 @@ def get_steps(
                 if not step.step_length < min_step_length:
                     steps.append(step)
     return sorted(steps, key=lambda step: step.FC.frame)
+
+
+# gait parameters to be calculated later
+GAIT_PARAMETERS = [
+    "stride_length",
+    "stride_time",
+    "stride_velocity",
+    "base_of_support",
+    "double_support_time",
+    "swing_time",
+    "knee_ext_rom",
+    "shoulder_flex_rom",
+    "shoulder_abd_rom",
+    "elbow_ext_rom",
+]
+
+# create dataclass for storing gait parameters
+parameters = [(parameter_name, float, np.nan) for parameter_name in GAIT_PARAMETERS]
+Parameters = make_dataclass(cls_name="Parameters", fields=parameters)
+
+
+class GaitCycle:
+    """
+    Class to representing a Gait Cycle. Calculates, checks and stores the propeprties of a GC.
+
+    Attributes:
+        possible_gait_events: GEs which might belong to this GC. They will be evaluated and if fit, the final GEs will be picked from this list.
+        keypoints: 3D keypoint (preprocessed) data in (frames, num_kpts, dims) shape.
+        labels: labels describing each keypoint
+        fps: recording frequency in Hz.
+        IC0: 1st IC type ipsilateral GE, regarded as the start of GC
+        IC2: last IC type ipsilateral GE, regarded as end of GC
+        IC1, FC0, FC1: rest of the GEs of the segment
+        ipsi: ipsilateral side (left/right)
+        contra: contralateral side
+        perspective: perspective of the segment to which the GEs belong
+        segment: whether the segment is straight/turn type
+        gait_events: the GEs that have been selected and verified to be part of this GC
+        parameters: Parameters type container, storing the results of calculated gait-cycle parameters
+        valid: see the valid property
+
+    """
+
+    def __init__(
+        self,
+        IC0: GaitEvent,
+        IC2: GaitEvent,
+        input_gait_events: list,
+        keypoint_data: np.ndarray,
+        labels: list,
+        fps,
+    ):
+
+        self.possible_gait_events = sorted(input_gait_events, key=lambda event: event.frame)
+        self.keypoints = keypoint_data
+        self.labels = labels
+        self.fps = fps
+
+        # IC0, IC2 are determined at the Recording level (checks are also performed there)
+        self.IC0 = IC0
+        self.IC2 = IC2
+
+        self.ipsi = self.IC0.side
+        self.contra = "left" if self.ipsi == "right" else "right"
+        self.perspective = self.IC0.perspective
+
+        # GE priorities (based on parameters): IC0-IC2, IC1, FC0-FC1 -> select IC1 first, then FC0, FC1
+        self.IC1 = self.select_gait_event(type="IC", side=self.contra)
+        self.FC0 = self.select_gait_event(
+            type="FC", side=self.contra, prev_event=self.IC0, next_event=self.IC1
+        )
+        self.FC1 = self.select_gait_event(
+            type="FC", side=self.ipsi, prev_event=self.IC1, next_event=self.IC2
+        )
+
+        # get rid of not found / non-existent GEs
+        self.gait_events = [ge for ge in [self.IC0, self.FC0, self.IC1, self.FC1, self.IC2] if ge]
+
+        self.parameters = Parameters()
+        self.calculate_stride_parameters()
+        self.calculate_knee_rom()
+        self.calculate_elbow_rom()
+        self.calculate_shoulder_rom()
+        if None not in [self.FC1]:
+            self.calculate_swing_time()
+        if None not in [self.IC1]:
+            self.calculate_base_of_support()
+            if None not in [self.FC0, self.FC1]:
+                self.calculate_double_support_time()
+
+    @property
+    def valid(self) -> bool:
+        """
+        True if all of these hold (IC1, FC0 and FC1 may be missing, only the found ones are checked):
+            IC0 and IC2 found
+            types: IC0, IC1, IC2 are ICs; FC0, FC1 are FCs
+            order: IC0 <= FC0 <= IC1 <= FC1 <= IC2 by frame, IC0 < IC2
+            sides: IC0, FC1, IC2 are ipsilateral; FC0, IC1 are contralateral
+            no turn: no found event has segment "turn" (events without a segment pass)
+        """
+        if self.IC0 is None or self.IC2 is None:
+            return False
+
+        expected = {
+            "IC0": ("IC", self.ipsi),
+            "FC0": ("FC", self.contra),
+            "IC1": ("IC", self.contra),
+            "FC1": ("FC", self.ipsi),
+            "IC2": ("IC", self.ipsi),
+        }
+        found_events = [
+            (getattr(self, name), event_type, side)
+            for name, (event_type, side) in expected.items()
+            if getattr(self, name) is not None
+        ]
+        types_ok = all(event.type == event_type for event, event_type, _ in found_events)
+        sides_ok = all(event.side == side for event, _, side in found_events)
+
+        frames = [event.frame for event, _, _ in found_events]
+        order_ok = self.IC0.frame < self.IC2.frame and all(
+            frame <= next_frame for frame, next_frame in zip(frames, frames[1:])
+        )
+
+        no_turn = all(event.segment != "turn" for event, _, _ in found_events)
+
+        return bool(types_ok and sides_ok and order_ok and no_turn)
+
+    # str() so that a None perspective (e.g. TUG events) can be padded
+    def __str__(self):
+        return f"{str(self.perspective):<10}{self.ipsi:<10}{[ge.frame for ge in self.gait_events]}"
+
+    def __repr__(self):
+        return f"{str(self.perspective):<10}{self.ipsi:<10}{self.contra:<10}{[ge.frame for ge in self.gait_events]}"
+
+    def calculate_stride_parameters(self) -> None:  # IC0, IC2
+        """
+        Computes stride_time, stride_lenght and stride_velocity.
+            Gait events needed: IC0, IC2
+
+        Sets:
+            parameters.stride_time
+            parameters.stride_length
+            parameters.stride_velocity
+        """
+        self.parameters.stride_time = (self.IC2.frame - self.IC0.frame) / self.fps
+
+        IC0_ankle = self.keypoints[self.IC0.frame, self.labels.index(f"{self.ipsi}_ankle"), :]
+        IC2_ankle = self.keypoints[self.IC2.frame, self.labels.index(f"{self.ipsi}_ankle"), :]
+        self.parameters.stride_length = np.linalg.norm(IC2_ankle - IC0_ankle)
+
+        self.parameters.stride_velocity = (
+            self.parameters.stride_length / self.parameters.stride_time
+            if self.parameters.stride_time > 0
+            else np.nan
+        )
+
+    def calculate_swing_time(self) -> None:  # FC1, IC2
+        """
+        Computes swing_time.
+            Gait events needed: FC1, IC2
+
+        Sets:
+            parameters.swing_time
+        """
+        if self.fps > 0:
+            self.parameters.swing_time = (self.IC2.frame - self.FC1.frame) / self.fps
+
+    def calculate_double_support_time(self) -> None:  # FC0, FC1, IC0, IC1
+        """
+        Computes double_support_time.
+            Gait events needed: FC0, FC1, IC0, IC1
+
+        Sets:
+            parameters.double_support_time
+        """
+        if self.fps > 0:
+            self.parameters.double_support_time = (
+                (self.FC0.frame - self.IC0.frame) + (self.FC1.frame - self.IC1.frame)
+            ) / self.fps
+
+    def calculate_base_of_support(self) -> None:  # IC0, IC1, IC2
+        """
+        Computes base_of_support.
+            Gait events needed: IC0, IC1, IC2
+
+        Sets:
+            parameters.base_of_support
+        """
+        # using ankles
+        IC1_ankle = self.keypoints[self.IC1.frame, self.labels.index(f"{self.contra}_ankle"), :]
+        IC0_ankle = self.keypoints[self.IC0.frame, self.labels.index(f"{self.ipsi}_ankle"), :]
+        IC2_ankle = self.keypoints[self.IC2.frame, self.labels.index(f"{self.ipsi}_ankle"), :]
+
+        IC2_IC0_line = IC2_ankle - IC0_ankle
+        IC0_IC1_line = IC0_ankle - IC1_ankle
+
+        self.parameters.base_of_support = np.linalg.norm(
+            np.cross(IC2_IC0_line, IC0_IC1_line)
+        ) / np.linalg.norm(IC2_IC0_line)
+
+    def calculate_knee_rom(self) -> None:  # IC0, IC2
+        """
+        Computes knee range of motion based on extension angle.
+            Gait events needed: IC0, IC2
+
+        Sets:
+            parameters.knee_ext_rom
+        """
+
+        hip_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.ipsi}_hip"), :
+        ]
+
+        knee_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.ipsi}_knee"), :
+        ]
+        ankle_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.ipsi}_ankle"), :
+        ]
+
+        # knee ROM
+        upper_leg_vector = knee_position - hip_position
+        lower_leg_vector = ankle_position - knee_position
+
+        # knee EXTENSION angle for all frames of the current gait-cycle, no projection
+        knee_angles = [
+            angle_between_vectors(lower_leg, upper_leg)
+            for lower_leg, upper_leg in zip(lower_leg_vector, upper_leg_vector)
+        ]
+        # knee range of motion = max(knee angle) - min(knee angle) in given gait cycle
+        self.parameters.knee_ext_rom = np.nanmax(knee_angles) - np.nanmin(knee_angles)
+        self.knee_ext_angles = knee_angles
+
+    def calculate_elbow_rom(self) -> None:  # IC0, IC2
+        """
+        Computes elbow range of motion based on flexion angle.
+            Gait events needed: IC0, IC2
+
+        Sets:
+            parameters.elbow_ext_rom
+        """
+        shoulder_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.contra}_shoulder"), :
+        ]
+        elbow_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.contra}_elbow"), :
+        ]
+        wrist_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.contra}_wrist"), :
+        ]
+
+        # arm rom (elbow flexion, shoulder flexion, shoulder adduction)
+        upper_arm_vector = elbow_position - shoulder_position
+        lower_arm_vector = wrist_position - elbow_position
+
+        # elbow flexion angle w/o projection
+        elbow_angles = [
+            angle_between_vectors(upper_arm, lower_arm)
+            for upper_arm, lower_arm in zip(upper_arm_vector, lower_arm_vector)
+        ]
+        self.elbow_ext_angles = elbow_angles
+        self.parameters.elbow_ext_rom = np.nanmax(elbow_angles) - np.nanmin(elbow_angles)
+
+    def calculate_shoulder_rom(self) -> None:  # IC0, IC2
+        """
+        Computes shoulder range of motion based on flexion/extension angle.
+            Shoulder flexion/extension: angle between torso vector (mid_shoulder-mid_hip) and upper arm (shoulder-elbow) projections in sagittal plane.
+            Shoulder adduction/abduction: angle between shoulder vector (left_shoulder-right_shoulder) and upper arm (shoulder-elbow) projections in coronal plane.
+        Gait events needed: IC0, IC2
+
+        Sets:
+            parameters.shoulder_flex_rom
+            parameters.shoulder_abd_rom
+            self.shoulder_flex_angles
+            self.shoulder_abd_angles
+        """
+        contra_shoulder_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.contra}_shoulder"), :
+        ]
+        ipsi_shoulder_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.ipsi}_shoulder"), :
+        ]
+        elbow_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"{self.contra}_elbow"), :
+        ]
+        mid_shoulder_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"mid_shoulder"), :
+        ]
+
+        mid_hip_position = self.keypoints[
+            self.IC0.frame : self.IC2.frame, self.labels.index(f"mid_hip"), :
+        ]
+
+        upper_arm_vector = elbow_position - contra_shoulder_position
+        torso_vector = mid_hip_position - mid_shoulder_position
+
+        sagittal_normal = contra_shoulder_position - ipsi_shoulder_position
+        coronal_normal = np.cross(sagittal_normal, torso_vector)
+
+        # shoulder flexion/extension angle with projection (torso and upper arm on sagittal plane)
+        sagittal_upper_arm_proj = get_projection(sagittal_normal, upper_arm_vector)
+        sagittal_torso_proj = get_projection(sagittal_normal, torso_vector)
+        shoulder_flex_angles = np.array(
+            [
+                angle_between_vectors(upper_arm_proj, torso_proj)
+                for upper_arm_proj, torso_proj in zip(sagittal_upper_arm_proj, sagittal_torso_proj)
+            ]
+        )
+        # arccos gives unsigned angles: sign them by which side of the torso line the arm is on.
+        # sagittal_normal points towards the contralateral shoulder, so it is flipped for the left
+        # arm: the sign is taken around a left -> right axis for both arms, so that flexion
+        # (arm in front of the torso) has the same sign on both sides
+        left_to_right = sagittal_normal if self.contra == "right" else -sagittal_normal
+        cross_product = np.cross(sagittal_torso_proj, sagittal_upper_arm_proj)
+        sign = np.sign(np.sum(cross_product * left_to_right, axis=1))
+        shoulder_flex_angles = sign * shoulder_flex_angles
+
+        self.parameters.shoulder_flex_rom = np.nanmax(shoulder_flex_angles) - np.nanmin(
+            shoulder_flex_angles
+        )
+        self.shoulder_flex_angles = shoulder_flex_angles
+
+        # shoulder abduction/adduction angle with projection (torso and upper arm on coronal plane)
+        coronal_torso_proj = get_projection(coronal_normal, torso_vector)
+        coronal_arm_proj = get_projection(coronal_normal, upper_arm_vector)
+        shoulder_abd_angles = [
+            angle_between_vectors(torso_proj, upper_arm_proj)
+            for torso_proj, upper_arm_proj in zip(coronal_torso_proj, coronal_arm_proj)
+        ]
+        self.parameters.shoulder_abd_rom = np.nanmax(shoulder_abd_angles) - np.nanmin(
+            shoulder_abd_angles
+        )
+        self.shoulder_abd_angles = shoulder_abd_angles
+
+    def select_gait_event(
+        self,
+        type: Literal["IC", "FC"],
+        side: Literal["left", "right"],
+        prev_event: GaitEvent = None,
+        next_event: GaitEvent = None,
+    ) -> GaitEvent | None:
+        """
+        Select the appropriate gait event from the possible_gait_events belonging to this gait cycle.
+
+        Args:
+            type: type of gait event
+            side: side of gait event
+            prev_event: previoius GE event (based on frame). Selected GE can only come after this
+            next_event: next GE event. Selected one must come before this.
+
+        Returns:
+            selected_gait_event: the first event (ranked by frame) that satisfies the criteria, otherwise None
+        """
+
+        frame_min = prev_event.frame if prev_event else self.IC0.frame
+        frame_max = next_event.frame if next_event else self.IC2.frame
+
+        specified_gait_events = [
+            ge
+            for ge in self.possible_gait_events
+            if (
+                ge.type == type
+                and ge.side == side
+                and ge.perspective == self.perspective
+                and frame_min <= ge.frame <= frame_max
+            )
+        ]
+        selected_gait_event = next(iter(specified_gait_events), None)
+        return selected_gait_event
+
+
+def get_gait_cycles(
+    gait_events: list[GaitEvent],
+    keypoints: np.ndarray,
+    labels: list[str],
+    fps: float,
+    max_stride_time: float,
+) -> list[GaitCycle]:
+    """
+    One GaitCycle per IC -> next IC of the same foot, if that IC comes within max_stride_time and
+    has the same perspective and segment (events without these, e.g. in the TUG, have None for
+    both, so they always match). Invalid cycles are kept, see GaitCycle.valid.
+
+    Args:
+        gait_events: events of the whole recording, e.g. from get_gait_events
+        keypoints: (frames, keypoints, 3) of the whole recording, indexed with recording frames
+        labels: keypoint labels
+        fps: sampling rate of the keypoints
+        max_stride_time: longer IC -> IC intervals (s) are not gait cycles
+    Returns:
+        gait cycles, in the order of their IC0 in gait_events
+    """
+    max_stride_frames = max_stride_time * fps
+    gait_cycles = []
+    for event in gait_events:
+        if event.type == "IC":
+            next_ipsi_IC = next(
+                iter(
+                    [
+                        ge
+                        for ge in gait_events
+                        if (
+                            ge.type == "IC"
+                            and ge.side == event.side
+                            and ge.frame > event.frame
+                            and ge.frame <= event.frame + max_stride_frames
+                            and ge.perspective == event.perspective
+                            and ge.segment == event.segment
+                        )
+                    ]
+                ),
+                None,
+            )
+            if next_ipsi_IC:
+                possible_events = [
+                    ge
+                    for ge in gait_events
+                    if (ge.frame >= event.frame and ge.frame <= next_ipsi_IC.frame)
+                ]
+                current_gait_cycle = GaitCycle(
+                    event, next_ipsi_IC, possible_events, keypoints, labels, fps
+                )
+                gait_cycles.append(current_gait_cycle)
+
+    return gait_cycles
 
 
 def plot_gait_event_debug_figure(
