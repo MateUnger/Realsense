@@ -360,14 +360,14 @@ models = {
 
 def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -> float:
     """
-    Samples the depth map using the median value of a patch (size radius+2).
+    Samples the depth map using the 10th percentile (near side) of a patch (size radius+2).
 
     Args:
         depth_map: array of depth values in landscape orientation
         x,y: center coords of sampling patch
         radius: size of patch
     Returns:
-        depth: median depth value of sampled patch (np.nan if no valid values)
+        depth: 10th percentile depth value of sampled patch (np.nan if no valid values)
     """
     h, w = depth_map.shape
     x_min, x_max = max(0, x - radius), min(w, x + radius + 1)
@@ -376,7 +376,7 @@ def sample_depth_patch(depth_map: np.ndarray, x: int, y: int, radius: int = 1) -
     ROI = depth_map[y_min:y_max, x_min:x_max]
     valid_ROI = ROI[ROI > 0]
 
-    depth = float(np.nanmedian(valid_ROI)) if valid_ROI.size > 0 else np.nan
+    depth = float(np.nanpercentile(valid_ROI, 10)) if valid_ROI.size > 0 else np.nan
 
     return depth
 
