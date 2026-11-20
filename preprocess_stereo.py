@@ -117,7 +117,7 @@ def convert(recording_name: str):
         width=color_intrinsics.width,
         height=color_intrinsics.height,
         fps=color_profile.fps(),
-        encoder="h264_qsv",
+        encoder="h264_nvenc",
         out_filename=out_filename_color,
     )
     video_color = subprocess.Popen(ffmpeg_color, stdin=subprocess.PIPE)

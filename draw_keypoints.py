@@ -20,9 +20,10 @@ parser.add_argument("recording_name", help="e.g. tug2")
 parser.add_argument("--source", choices=["stereo", "qualisys"], default="stereo")
 args = parser.parse_args()
 
+DATA_FOLDER = r"C:\Users\munger\realsense_validation_data"
 recording_name = args.recording_name
 keypoints, labels = load_keypoints_and_labels(
-    filename=os.path.join("data", recording_name, f"{recording_name}_{args.source}.npz")
+    filename=os.path.join(DATA_FOLDER, recording_name, f"{recording_name}_{args.source}.npz")
 )
 
 frame = 0
