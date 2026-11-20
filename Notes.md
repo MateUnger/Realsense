@@ -4,6 +4,8 @@
 - <mark>TODO:</mark> need iPad, test sync
 - <mark>TODO:</mark> learn how to do Pull test
 - <mark>TODO:</mark> uniform clothing? 
+- preferred, tug, airing chair, balancing - 2X 
+- beep, T, start position, beep
 
 iPad sync
 - start qtm

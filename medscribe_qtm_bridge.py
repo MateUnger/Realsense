@@ -58,8 +58,9 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 class QtmController:
     """Hält die RT-Verbindung zu QTM inkl. Kontrolle und steuert Start/Stop/Save."""
 
-    def __init__(self, args):
+    def __init__(self, args, realsense=None):
         self.args = args
+        self.realsense = realsense  # RealSenseRecorder oder None (--realsense-dir "")
         self.conn = None
         self.capturing = False
         self.lock = asyncio.Lock()
@@ -150,6 +151,10 @@ class QtmController:
             await asyncio.sleep(interval)
 
     async def shutdown(self):
+        # Laufende RealSense-Aufnahme beenden, sonst bleibt die .db3 unvollständig
+        if self.realsense is not None and self.realsense.recording:
+            await asyncio.to_thread(self.realsense.stop,
+                                    f"{self.args.prefix}_{datetime.now():%Y-%m-%d_%H-%M-%S}_abgebrochen")
         if self.connected:
             try:
                 await self.conn.release_control()
@@ -172,8 +177,9 @@ class QtmController:
         finally:
             self._waiters.pop(event, None)
 
-    async def start(self):
-        """Gibt True zurück, wenn QTM die Aufnahme gestartet hat."""
+    async def start(self, meta=None):
+        """Gibt True zurück, wenn QTM die Aufnahme gestartet hat. meta (aus REC:META)
+        bestimmt das RealSense-Preset."""
         async with self.lock:
             if not await self.ensure_connected():
                 LOG.error("START verworfen – keine Verbindung zu QTM")
@@ -188,6 +194,13 @@ class QtmController:
                 ok = await self._send_and_wait(conn.start, QRTEvent.EventCaptureStarted, 15)
                 if ok:
                     LOG.info("QTM-Aufnahme gestartet (%.0f ms)", (time.monotonic() - t0) * 1000)
+                    if self.realsense is not None:
+                        from realsense_recorder import choose_preset
+                        preset_name = choose_preset(meta, self.args.realsense_preset)
+                        # blockiert ~1-2 s (Kamera-Start), daher im Thread
+                        await asyncio.to_thread(
+                            self.realsense.start, preset_name, meta,
+                            safe_uuid((meta or {}).get("recording_uuid")))
                 else:
                     LOG.warning("Start gesendet, aber kein 'Capture started' von QTM erhalten")
                 # Auch ohne Bestätigungs-Event: der Start-Befehl ist durch, die
@@ -213,6 +226,9 @@ class QtmController:
                 if not ok:
                     LOG.warning("Stop gesendet, aber kein 'Capture stopped' von QTM erhalten")
                 LOG.info("QTM-Aufnahme gestoppt")
+
+                if self.realsense is not None and self.realsense.recording:
+                    await asyncio.to_thread(self.realsense.stop, basename, f"{basename}.qtm")
 
                 # Ohne Pfad speichert QTM im Data-Ordner des aktuellen Projekts
                 filename = f"{basename}.qtm"
@@ -438,7 +454,12 @@ def stdin_reader(loop, queue):
 async def run(args):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
-    qtm = QtmController(args)
+    realsense = None
+    if args.realsense_dir:
+        # erst hier importieren, damit die Bridge ohne pyrealsense2 weiter läuft
+        from realsense_recorder import RealSenseRecorder
+        realsense = RealSenseRecorder(args.realsense_dir, args.realsense_preset)
+    qtm = QtmController(args, realsense)
     tracker = RecordingTracker(args)
 
     if args.manual:
@@ -456,7 +477,7 @@ async def run(args):
             if line == LINE_START:
                 LOG.info("ESP32: Aufnahme START")
                 meta = tracker.take_pending_for_start()
-                if await qtm.start():
+                if await qtm.start(meta):
                     tracker.started(meta)
             elif line == LINE_STOP:
                 LOG.info("ESP32: Aufnahme STOP")
@@ -535,6 +556,14 @@ def main():
                    help="Max. Capture-Dauer in s, die in QTM gesetzt wird (0 = nicht ändern)")
     p.add_argument("--timeout", type=float, default=60,
                    help="Timeout für QTM-Kommandos in s (Speichern kann bei langen Aufnahmen dauern)")
+    p.add_argument("--realsense-dir", default=r"C:\Users\munger\realsense_validation_data",
+                   help="Ordner für RealSense-Aufnahmen, Datei: <dir>/<name>/<name>.db3 "
+                        "(Default: C:\\Users\\munger\\realsense_validation_data). "
+                        "--realsense-dir \"\" schaltet die RealSense-Aufnahme ab")
+    p.add_argument("--realsense-preset", default="848x480@60",
+                   choices=["848x480@60", "640x360@90", "480x270@90"],
+                   help="Auflösung@fps der RealSense, wenn Kategorie/Condition aus der App "
+                        "keinen Eintrag in PRESET_BY_CATEGORY haben (Default: 848x480@60)")
     p.add_argument("-v", "--verbose", action="store_true", help="Auch übrige ESP32-Ausgaben loggen")
     args = p.parse_args()
 
