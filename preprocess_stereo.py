@@ -4,7 +4,7 @@ Stages (each reads the previous stage's file from data/<name>/):
     convert      .db3 -> filter -> align -> _color.mp4, _depth.mkv, _timestamps_*.bin, _metadata.json
     keypoints_2d _color.mp4 -> _keypoints_2d.npy
     keypoints_3d _keypoints_2d.npy + _depth.mkv -> _keypoints_3d.npy
-    calibration  calibration_image.png + _keypoints_3d.npy -> _keypoints_3d_global.npy
+    calibration  calibration_image_high_res.png (or _low_res.png) +_keypoints_3d.npy -> _keypoints_3d_global.npy
     resample     _keypoints_3d_global.npy -> filter, resample to 100 Hz, axis swap -> _stereo.npz
 
 Usage (from the repo root):
@@ -40,11 +40,14 @@ from Util.util import (
     labels_26,
 )
 
-DATA_FOLDER = "data"
+# DATA_FOLDER = "data"
+DATA_FOLDER = r"C:\Users\munger\realsense_validation_data"
 
 # pose estimation settings
 DETECTOR = "yolo_nano"  # 'yolo_nano', 'yolo_m', 'yolo_l', 'yolo_x'
-POSE_ESTIMATOR = "rtm_pose_x_17"  # 'rtm_pose_t_17', ..., 'rtm_pose_x_17', 'vit_pose_l_17', 'rtm_pose_t_26', ...
+POSE_ESTIMATOR = (
+    "rtm_pose_x_17"  # 'rtm_pose_t_17', ..., 'rtm_pose_x_17', 'vit_pose_l_17', 'rtm_pose_t_26', ...
+)
 LABELS = labels_17  # labels_26, labels_17
 
 # calibration chessboard
@@ -185,8 +188,12 @@ def convert(recording_name: str):
 
             # the frameset timestamp follows the depth frame, but the keypoints come from the color
             # frame, so get_frame_times has to remove duplicates and place frames by the color timestamp
-            timestamps_color_out.write(np.float64(frames.get_color_frame().get_timestamp()).tobytes())
-            timestamps_depth_out.write(np.float64(frames.get_depth_frame().get_timestamp()).tobytes())
+            timestamps_color_out.write(
+                np.float64(frames.get_color_frame().get_timestamp()).tobytes()
+            )
+            timestamps_depth_out.write(
+                np.float64(frames.get_depth_frame().get_timestamp()).tobytes()
+            )
 
             frame_count += 1
             progress_bar.update(1)
@@ -434,7 +441,9 @@ def keypoints_3d(recording_name: str):
     if depth_exit_code != 0:
         raise RuntimeError(f"ffmpeg depth decoding failed with exit code {depth_exit_code}")
     if frame_idx != n_frames:
-        raise RuntimeError(f"read {frame_idx} depth frames, but the conversion wrote {n_frames} frames")
+        raise RuntimeError(
+            f"read {frame_idx} depth frames, but the conversion wrote {n_frames} frames"
+        )
 
     keypoints_3d_array = np.asanyarray(keypoints_3d_per_frame)
     np.save(out_filename_keypoints_3d, keypoints_3d_array)
@@ -442,10 +451,24 @@ def keypoints_3d(recording_name: str):
 
 
 def calibration(recording_name: str):
-    """chessboard on calibration_image.png -> 3D keypoints in the chessboard (global) frame"""
+    """chessboard on calibration_image_high_res.png (or _low_res.png) -> 3D keypoints in the chessboard (global) frame"""
     filename_metadata = get_path(recording_name, "_metadata.json")
     filename_keypoints_3d = get_path(recording_name, "_keypoints_3d.npy")
-    filename_calibration_img = os.path.join(DATA_FOLDER, recording_name, "calibration_image.png")
+    filename_calibration_img_high_res = os.path.join(
+        DATA_FOLDER, recording_name, "calibration_image_high_res.png"
+    )
+    filename_calibration_img_low_res = os.path.join(
+        DATA_FOLDER, recording_name, "calibration_image_low_res.png"
+    )
+    if os.path.exists(filename_calibration_img_high_res):
+        filename_calibration_img = filename_calibration_img_high_res
+    elif os.path.exists(filename_calibration_img_low_res):
+        filename_calibration_img = filename_calibration_img_low_res
+    else:
+        raise FileNotFoundError(
+            f"no calibration image found: {filename_calibration_img_high_res} or {filename_calibration_img_low_res}"
+        )
+    print(f"using calibration image: {filename_calibration_img}")
     out_filename_keypoints_3d_global = get_path(recording_name, "_keypoints_3d_global.npy")
     check_files_exist([filename_metadata, filename_keypoints_3d, filename_calibration_img])
 
@@ -529,7 +552,9 @@ def resample(recording_name: str):
     keypoints_3d_axis_swap = stereo_to_qualisys_axes(keypoints_3d_resampled)
 
     np.savez(filename_stereo_keypoints, labels=labels, keypoints=keypoints_3d_axis_swap)
-    print(f"stereo keypoints saved to: {filename_stereo_keypoints} with shape: {keypoints_3d_axis_swap.shape}")
+    print(
+        f"stereo keypoints saved to: {filename_stereo_keypoints} with shape: {keypoints_3d_axis_swap.shape}"
+    )
 
 
 STAGE_FUNCTIONS = {
@@ -551,7 +576,9 @@ if __name__ == "__main__":
 
     for recording_name in args.recording_names:
         if not os.path.isdir(os.path.join(DATA_FOLDER, recording_name)):
-            raise FileNotFoundError(f"Folder {os.path.join(DATA_FOLDER, recording_name)} does not exist")
+            raise FileNotFoundError(
+                f"Folder {os.path.join(DATA_FOLDER, recording_name)} does not exist"
+            )
         for stage in STAGES:
             if stage in args.stages:
                 print(f"\n=== {recording_name}: {stage} ===")
